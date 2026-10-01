@@ -1,0 +1,65 @@
+https://github.com/mwillsey/microegg/tree/main/src
+https://www.philipzucker.com/le_find/
+https://www.philipzucker.com/asymmetric_complete/
+https://github.com/golang/go/blob/master/src/cmd/compile/internal/ssa/poset.go#L100 poset union find?
+
+https://github.com/philzook58/lambda-microegg
+
+
+
+A circuit can be refined from don't cares.
+
+Semantics of a circuit is fun x y z -> Set Bool. So a combination of refinement and lambda might be interesting. But we can work with names for now.
+
+A -> Set B  ~~ Set (AxB)   although maybe we want Set B to be nonempty?
+
+
+a don't care is a {True, False}
+which can be refined to a {True} or {False} result which is a determinsitci implementation
+
+untyped monotonicity declarations
+(fun f (+ + - =))  - whether to propagate monotonically, antimonotoically or isotonically wrt arguments
+Declaration describes how rebuilding propagates less-than-equal facts up thorugh enodes.
+
+
+Graham asks: Is refinement egraph concepts supplied by egg / egglog analyses. I'm inclinced to say no.
+
+A canonical example is a set algebra
+
+https://en.wikipedia.org/wiki/Algebra_of_sets
+https://en.wikipedia.org/wiki/List_of_set_identities_and_relations
+
+```
+(fun U (+ +)) ; union
+(fun I (+ +))
+(fun diff (+ -)) ; set difference is anti-monotone in second arg
+
+
+(rewrite (U ?a ?b) (U ?b ?a))  ; in
+(lte A B) ;; assert A is less than equal to B
+()
+
+(refine (I ?a ?b)  ?a) ; intersection is less than 
+(antirefine (U ?a ?b) ?a))   ; a better name? refine- or generalize or ..? Union is
+
+(rewrite )  ; equality
+
+; Any nice syntax to combine refine antirefine and rewrite?
+; ?a- ?a= ?a+   to allow matching above and below
+; ( ) equality subterm {} all terms below [] all terms above?
+; So that using () gives you the usual.
+```
+
+lambda + refinement: bigunion and biginter
+(refine (@biginter x {?A x})  (A ?foo))  get foo from multipattern? Bake in? Hmm.
+LFP and GFP style reasoning is quite ubiquitous
+
+
+
+similar to Ocaml +- variance?
+
+
+
+
+
+

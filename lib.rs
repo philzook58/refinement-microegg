@@ -1,0 +1,392 @@
+/*!
+
+A simple e-graph in the style of egg's SymbolLang.
+
+ */
+pub mod script;
+pub mod util;
+use crate::util::*;
+use std::time::{Duration, Instant};
+
+/// Timing for one rewrite round after the graph has been rebuilt.
+pub struct StepProfile {
+    pub matching: Duration,
+    pub applying: Duration,
+    pub rebuilding: Duration,
+    pub matches: usize,
+    pub new_nodes: usize,
+    pub unions: usize,
+    pub changed: bool,
+}
+
+// The basics
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+pub struct Node(Symbol, Vec<Id>);
+
+impl std::fmt::Display for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.1.is_empty() {
+            write!(f, "{}", self.0)
+        } else {
+            write!(f, "({} {})", self.0, DisplayIter(&self.1, " "))
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct EGraph {
+    // maps e-nodes to the class they are in
+    nodes: IndexMap<Node, Id>,
+    // the reverse map, from class to the e-nodes in that class
+    rev: IndexMap<Id, Vec<Node>>,
+    uf: UnionFind,
+}
+
+impl EGraph {
+    pub fn equivalent(&self, a: Id, b: Id) -> bool {
+        self.uf.are_eq(a, b)
+    }
+    pub fn statistics(&self) -> (usize, usize) {
+        (self.rev.len(), self.nodes.len())
+    }
+    pub fn match_count(&self, pattern: &Sexp) -> usize {
+        self.rev
+            .keys()
+            .map(|&class| self.ematch(pattern, class).len())
+            .sum()
+    }
+    pub fn dump(&self) -> String {
+        self.rev
+            .iter()
+            .map(|(id, nodes)| format!("{id}: {}", DisplayIter(nodes, ", ")))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Run one rewrite round, returning whether any nodes or classes changed.
+    pub fn rewrite_step(&mut self, rewrites: &[Rewrite]) -> bool {
+        self.rebuild();
+        let before = (self.nodes.len(), self.uf.n_classes());
+        self.rewrite(rewrites);
+        self.rebuild();
+        before != (self.nodes.len(), self.uf.n_classes())
+    }
+
+    /// Pick the smallest finite term in a class. Cycles are skipped.
+    pub fn extract(&self, id: Id) -> Option<Sexp> {
+        let mut best: IndexMap<Id, (usize, Sexp)> = IndexMap::default();
+        loop {
+            let mut changed = false;
+            for (&class, nodes) in &self.rev {
+                for node in nodes {
+                    let mut cost = 1usize;
+                    let mut args = Vec::new();
+                    let mut ready = true;
+                    for child in &node.1 {
+                        if let Some((child_cost, term)) = best.get(&self.uf.find(*child)) {
+                            cost = cost.saturating_add(*child_cost);
+                            args.push(term.clone());
+                        } else {
+                            ready = false;
+                            break;
+                        }
+                    }
+                    if !ready || best.get(&class).is_some_and(|(old, _)| *old <= cost) {
+                        continue;
+                    }
+                    let term = if args.is_empty() {
+                        Sexp::Atom(node.0)
+                    } else {
+                        let mut items = vec![Sexp::Atom(node.0)];
+                        items.extend(args);
+                        Sexp::List(items)
+                    };
+                    best.insert(class, (cost, term));
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        best.get(&self.uf.find(id)).map(|(_, term)| term.clone())
+    }
+
+    pub fn add_node(&mut self, node: Node) -> Id {
+        let node = self.canonicalize_node(&node);
+        let id = *self.nodes.entry(node).or_insert_with(|| self.uf.mkset());
+        self.uf.find_mut(id)
+    }
+
+    /// Parse and add an s-exp in one step, useful for testing
+    pub fn add(&mut self, s: &str) -> Id {
+        self.instantiate(&s.parse().unwrap(), &Subst::default())
+    }
+
+    pub fn union(&mut self, a: Id, b: Id) -> bool {
+        self.uf.union(a, b)
+    }
+
+    pub fn nodes_in_class(&self, class: Id) -> impl Iterator<Item = &Node> {
+        let class = self.uf.find(class);
+        self.rev.get(&class).into_iter().flatten()
+    }
+
+    fn is_node_canonical(&self, node: &Node) -> bool {
+        node.1.iter().all(|id| self.uf.is_leader(*id))
+    }
+
+    pub fn canonicalize_node(&mut self, node: &Node) -> Node {
+        Node(
+            node.0.clone(),
+            node.1.iter().map(|id| self.uf.find_mut(*id)).collect(),
+        )
+    }
+
+    pub fn rebuild(&mut self) {
+        let mut keep_going = true;
+        while keep_going {
+            keep_going = false;
+            let nodes = std::mem::take(&mut self.nodes);
+            for (node, id) in nodes {
+                let node = self.canonicalize_node(&node);
+                let id = self.uf.find_mut(id);
+                let id2 = *self.nodes.entry(node).or_insert(id);
+                if self.union(id, id2) {
+                    keep_going = true;
+                }
+            }
+        }
+
+        // rebuild the reverse map from scratch
+        self.rev.clear();
+        for (node, id) in &self.nodes {
+            self.rev.entry(*id).or_default().push(node.clone());
+        }
+        self.rev.sort_keys();
+
+        if cfg!(debug_assertions) {
+            // nodes in nodes are canonical
+            for (node, id) in &self.nodes {
+                assert!(self.uf.is_leader(*id));
+                assert!(self.is_node_canonical(node));
+            }
+
+            // nodes in class map are canonical
+            for (id, nodes) in &self.rev {
+                assert!(self.uf.is_leader(*id));
+                for node in nodes {
+                    assert!(self.is_node_canonical(node));
+                }
+            }
+
+            // class map has exactly the leaders
+            for i in 0..self.uf.n_classes() {
+                let id = Id::new(i);
+                if self.uf.is_leader(id) {
+                    assert!(self.rev.contains_key(&id));
+                } else {
+                    assert!(!self.rev.contains_key(&id));
+                }
+            }
+        }
+    }
+
+    pub fn print_statistics(&self) {
+        let n_classes = self.rev.len();
+        let n_nodes = self.nodes.len();
+        println!("classes: {n_classes}, nodes: {n_nodes}");
+    }
+
+    pub fn print(&self) {
+        for (id, nodes) in &self.rev {
+            println!("{id}: {}", DisplayIter(nodes, ", "));
+        }
+    }
+}
+
+// e-matching
+// we will reuse sexps as patterns, where atoms starting with ? are treated as pattern variables
+impl EGraph {
+    pub fn ematch(&self, pat: &Sexp, class: Id) -> Vec<Subst> {
+        self.ematch_rec(pat, class, Default::default())
+    }
+    pub fn ematch_rec(&self, pat: &Sexp, class: Id, subst: Subst) -> Vec<Subst> {
+        match pat {
+            Sexp::Atom(name) => {
+                // all atoms beginning with ? are treated as pattern variables
+                let subst: Option<Subst> = if name.as_str().starts_with('?') {
+                    subst.with(*name, class)
+                } else {
+                    let leaf = Node(*name, vec![]);
+                    (self.nodes.get(&leaf) == Some(&class)).then(|| subst)
+                };
+                subst.into_iter().collect()
+            }
+            Sexp::List(items) => {
+                let Some((Sexp::Atom(f), args)) = items.split_first() else {
+                    panic!("expected atom at head of list");
+                };
+                self.nodes_in_class(class)
+                    .filter(|node| (node.0, node.1.len()) == (*f, args.len()))
+                    .flat_map(|node| {
+                        let init = vec![subst.clone()];
+                        args.iter().zip(&node.1).fold(init, |todo, (pa, &na)| {
+                            let rec = |subst| self.ematch_rec(pa, na, subst);
+                            todo.into_iter().flat_map(rec).collect()
+                        })
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+pub type Rewrite = (Sexp, Sexp);
+
+// rewriting, rebuilding
+impl EGraph {
+    pub fn instantiate(&mut self, pattern: &Sexp, subst: &Subst) -> Id {
+        match pattern {
+            Sexp::Atom(name) if name.as_str().starts_with('?') => subst[*name],
+            Sexp::Atom(name) => self.add_node(Node(*name, vec![])),
+            Sexp::List(items) => {
+                let Some((Sexp::Atom(f), args)) = items.split_first() else {
+                    panic!("expected atom at head of list");
+                };
+                let rec = |arg| self.instantiate(arg, subst);
+                let args = args.iter().map(rec).collect();
+                self.add_node(Node(*f, args))
+            }
+        }
+    }
+
+    pub fn rewrite(&mut self, rewrites: &[Rewrite]) {
+        let matches = self.collect_matches(rewrites);
+        self.apply_matches(matches);
+    }
+
+    fn collect_matches<'a>(&self, rewrites: &'a [Rewrite]) -> Vec<(&'a Sexp, Id, Vec<Subst>)> {
+        let mut all_matches = vec![];
+        for rw in rewrites {
+            for &class in self.rev.keys() {
+                let matches = self.ematch(&rw.0, class);
+                if !matches.is_empty() {
+                    all_matches.push((&rw.1, class, matches));
+                }
+            }
+        }
+        all_matches
+    }
+
+    fn apply_matches(&mut self, all_matches: Vec<(&Sexp, Id, Vec<Subst>)>) -> usize {
+        let mut unions = 0;
+        for (rhs, class, matches) in all_matches {
+            for subst in matches {
+                let replacement = self.instantiate(rhs, &subst);
+                unions += usize::from(self.union(class, replacement));
+            }
+        }
+        unions
+    }
+
+    /// Profile a round with the same match/apply/rebuild sequence as `rewrite_to_fixed`.
+    /// Call `rebuild` before the first round.
+    pub fn profile_step(&mut self, rewrites: &[Rewrite]) -> StepProfile {
+        let before = (self.nodes.len(), self.uf.n_classes());
+        let start = Instant::now();
+        let matches = self.collect_matches(rewrites);
+        let matching = start.elapsed();
+        let match_count = matches
+            .iter()
+            .map(|(_, _, substitutions)| substitutions.len())
+            .sum();
+        let start = Instant::now();
+        let unions = self.apply_matches(matches);
+        let applying = start.elapsed();
+        let new_nodes = self.nodes.len() - before.0;
+        let start = Instant::now();
+        self.rebuild();
+        let rebuilding = start.elapsed();
+        StepProfile {
+            matching,
+            applying,
+            rebuilding,
+            matches: match_count,
+            new_nodes,
+            unions,
+            changed: before != (self.nodes.len(), self.uf.n_classes()),
+        }
+    }
+
+    pub fn rewrite_to_fixed(&mut self, rewrites: &[Rewrite]) {
+        self.rebuild();
+        loop {
+            let before = (self.nodes.len(), self.uf.n_classes());
+            self.rewrite(rewrites);
+            self.rebuild();
+            let after = (self.nodes.len(), self.uf.n_classes());
+            if before == after {
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn test_rebuild() {
+    let mut eg = EGraph::default();
+    let b = eg.add("b");
+    let c = eg.add("c");
+    let f1 = eg.add("(f a b)");
+    let f2 = eg.add("(f a c)");
+
+    eg.union(b, c);
+    assert!(!eg.uf.are_eq(f1, f2));
+
+    eg.rebuild();
+    assert!(eg.uf.are_eq(f1, f2));
+}
+
+#[test]
+fn test_match() {
+    let mut eg = EGraph::default();
+    let f1 = eg.add("(f a a)");
+    let f2 = eg.add("(f b b)");
+    let f3 = eg.add("(f a b)");
+
+    eg.union(f1, f2);
+    eg.union(f2, f3);
+    eg.rebuild();
+
+    let fxx_matches = eg.ematch(&sexp("(f ?x ?x)"), f1);
+    assert_eq!(fxx_matches.len(), 2);
+
+    let fxy_matches = eg.ematch(&sexp("(f ?x ?y)"), f1);
+    assert_eq!(fxy_matches.len(), 3);
+}
+
+#[test]
+fn test_ac_rewriting() {
+    let mut eg = EGraph::default();
+
+    let n = var_parse_or("n", 7);
+    let atoms = (0..n).map(|i| format!("x{}", i));
+    let f = |acc, x| format!("(f {acc} {x})");
+    let input = atoms.clone().reduce(f).unwrap();
+    let goal = atoms.rev().reduce(f).unwrap();
+
+    let input = eg.add(&input);
+    let goal = eg.add(&goal);
+    let rws = [
+        (sexp("(f (f ?x ?y) ?z)"), sexp("(f ?x (f ?y ?z))")),
+        (sexp("(f ?x ?y)"), sexp("(f ?y ?x)")),
+    ];
+
+    eg.rewrite_to_fixed(&rws);
+    eg.print_statistics();
+
+    assert!(eg.uf.are_eq(input, goal));
+
+    assert_eq!(eg.uf.n_classes(), 2usize.pow(n as _) - 1);
+}
