@@ -23,6 +23,11 @@ Declaration describes how rebuilding propagates less-than-equal facts up thorugh
 
 
 Graham asks: Is refinement egraph concepts supplied by egg / egglog analyses. I'm inclinced to say no.
+Upper sets and lower sets do merge on union... So they do live in analysis position in that sense.
+They also transitively close
+it is unlcear if eager transitivity is better or worse.
+
+
 
 A canonical example is a set algebra
 
@@ -62,4 +67,68 @@ similar to Ocaml +- variance?
 
 
 
+
+```
+(rewrite (ite ?x true false) ?x)
+
+(le true dontcase)
+(le false dontcase)
+
+(insert (ite x true dontcare))
+
+(run 1) ; (rebuild?)
+
+(extract-refined (ite x true dontcare)) ; can it find x ?
+
+
+```
+
+
+```
+
+(le A B)
+(le B C)
+(le C D)
+(le D E)
+(le E F)
+
+(fun union (+ +))
+(insert (union A B C D E F G)
+; give AC rules of union
+
+
+
+
+```
+
+Yes, so trying not to materialize eveywhere seems good
+The sparse le relation seems better in terms of memory and then time
+
+
+The non-enode creating "variance closure" / refinement closure tat does multi argumetn cartisian earch
+(rule ((f a b c) (f e g h) (a <= e) (b <= g) (c <= h))   
+     (<= (f a b c) (f e g h)))
+
+     rather than the enode creating 
+(rule ((f a b c) (a <= e) (b <= g) (c <= h))   
+     (<= (f a b c) (f e g h)))
+
+
+This combined with e-matching
+
+(rewrite L R) can this even make sense with allowing L as a constraint?
+
+
+subtyping
+relation algebra - algebra of programming refining relational spec into functional spec? https://en.wikipedia.org/wiki/Relation_algebra
+https://www.philipzucker.com/a-short-skinny-on-relations-towards-the-algebra-of-programming/
+
+galois connections?
+(rule (<= (f a) b)  (<= a (g b))not persay a rewrite. 
+This is more like a solve-eq rule (rule (= x (+ y z)) (= (x - z) y)
+
+
+
+So sometimes we may want to extract the most refined thing and of those, the best one. A lex extraction of refinement (refine, cost)
+subsets
 

@@ -1,6 +1,23 @@
+#[cfg(not(target_arch = "wasm32"))]
 use clap::{Arg, Command};
+#[cfg(not(target_arch = "wasm32"))]
 use std::{io::Read, path::PathBuf};
 
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn run_wasm(input: &str) -> Result<String, JsValue> {
+    refinement_microegg::script::run(input)
+        .map(|lines| lines.join("\n"))
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     let matches = Command::new("refinement-microegg")
         .about("Run non-binder lambda-microegg S-expression scripts")

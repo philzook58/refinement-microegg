@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Refinement MicroEgg</title>
+  <style>
+    html {
+      max-width: 70ch;
+      padding: 3em 1em;
+      margin: auto;
+      line-height: 1.6;
+      font: 1.1em sans-serif;
+    }
+    textarea {
+      box-sizing: border-box;
+      width: 100%;
+      font: 0.9em monospace;
+    }
+    #program { min-height: 28em; }
+    #output { min-height: 10em; }
+  </style>
+</head>
+<body>
+  <h1>Refinement MicroEgg</h1>
+  <p><a href="https://github.com/philzook58/refinement-microegg">GitHub</a></p>
+
+  <label for="demo">Demo:</label>
+  <select id="demo">
+    <option value="refinement.sexp">Set inclusion</option>
+    <option value="dontcare.sexp">Circuit don't-care</option>
+    <option value="set_algebra.sexp">Set algebra</option>
+    <option value="ac_le.sexp">AC with inclusion</option>
+  </select>
+  <button id="run" type="button" disabled>Run</button>
+
+  <p><textarea id="program" spellcheck="false" aria-label="Program"></textarea></p>
+  <p><textarea id="output" readonly aria-label="Output"></textarea></p>
+
+  <script type="module">
+    import init, { run_wasm } from "./pkg/refinement_microegg.js";
+
+    const demo = document.querySelector("#demo");
+    const run = document.querySelector("#run");
+    const program = document.querySelector("#program");
+    const output = document.querySelector("#output");
+
+    async function loadDemo() {
+      const response = await fetch(`./examples/${demo.value}`);
+      if (!response.ok) throw new Error(`could not load ${demo.value}`);
+      program.value = await response.text();
+      const url = new URL(location.href);
+      url.searchParams.set("demo", demo.value);
+      history.replaceState(null, "", url);
+    }
+
+    const selected = new URLSearchParams(location.search).get("demo");
+    if (selected && [...demo.options].some(option => option.value === selected)) {
+      demo.value = selected;
+    }
+
+    const ready = init();
+    ready.then(() => run.disabled = false).catch(error => output.value = String(error));
+    loadDemo().catch(error => output.value = String(error));
+
+    demo.addEventListener("change", () => {
+      loadDemo().catch(error => output.value = String(error));
+    });
+
+    run.addEventListener("click", async () => {
+      output.value = "";
+      try {
+        await ready;
+        output.value = run_wasm(program.value);
+      } catch (error) {
+        output.value = String(error);
+      }
+    });
+  </script>
+</body>
+</html>

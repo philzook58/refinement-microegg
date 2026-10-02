@@ -15,3 +15,7 @@ clap = "=4.6.6"
 indexmap = "2.13"
 rustc-hash = "2.1"
 symbol_table = { version = "0.5", features = ["global"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.128"
+web-time = "=1.1.0"

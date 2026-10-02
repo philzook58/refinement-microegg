@@ -6,7 +6,11 @@ A simple e-graph in the style of egg's SymbolLang.
 pub mod script;
 pub mod util;
 use crate::util::*;
+use rustc_hash::FxHashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, Instant};
+#[cfg(target_arch = "wasm32")]
+use web_time::{Duration, Instant};
 
 /// Timing for one rewrite round after the graph has been rebuilt.
 pub struct StepProfile {
@@ -22,6 +26,29 @@ pub struct StepProfile {
 // The basics
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct Node(Symbol, Vec<Id>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Variance {
+    Covariant,
+    Contravariant,
+    Invariant,
+}
+
+/// Experimental ways to propagate declared variance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VarianceStrategy {
+    Eager,
+    #[default]
+    Cartesian,
+    Pairwise,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VarianceProfile {
+    pub time: Duration,
+    pub candidates: u64,
+    pub edges_added: u64,
+}
 
 impl std::fmt::Display for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,11 +67,76 @@ pub struct EGraph {
     // the reverse map, from class to the e-nodes in that class
     rev: IndexMap<Id, Vec<Node>>,
     uf: UnionFind,
+    variance: IndexMap<Symbol, Vec<Variance>>,
+    variance_strategy: VarianceStrategy,
+    variance_profile: VarianceProfile,
+    needs_rebuild: bool,
 }
 
 impl EGraph {
+    pub fn set_variance_strategy(&mut self, strategy: VarianceStrategy) {
+        self.variance_strategy = strategy;
+    }
+
+    /// Perform at most `limit` eager variance passes, materializing derived
+    /// enodes and order edges. This does not apply rewrite rules.
+    pub fn refinement_closure(&mut self, limit: usize) {
+        let previous = self.variance_strategy;
+        self.variance_strategy = VarianceStrategy::Eager;
+        for _ in 0..limit {
+            if !self.rewrite_step_with_order(&[], &[], &[]) {
+                break;
+            }
+        }
+        self.variance_strategy = previous;
+    }
+
+    pub fn variance_profile(&self) -> VarianceProfile {
+        self.variance_profile
+    }
+
+    /// Experimental order index that materializes known <= pairs during rebuild.
+    pub fn with_materialized_order() -> Self {
+        Self {
+            uf: UnionFind::with_materialized_closure(),
+            ..Self::default()
+        }
+    }
+
     pub fn equivalent(&self, a: Id, b: Id) -> bool {
         self.uf.are_eq(a, b)
+    }
+    pub fn assert_le(&mut self, a: Id, b: Id) -> bool {
+        let changed = self.uf.assert_le(a, b);
+        self.needs_rebuild |= changed;
+        changed
+    }
+    pub fn is_le(&self, a: Id, b: Id) -> bool {
+        self.uf.is_le(a, b)
+    }
+    pub fn upper_classes(&self, id: Id) -> Vec<Id> {
+        self.uf.upper_set(id)
+    }
+    pub fn lower_classes(&self, id: Id) -> Vec<Id> {
+        self.uf.lower_set(id)
+    }
+    pub fn declare_variance(&mut self, symbol: Symbol, args: Vec<Variance>) -> Result<(), String> {
+        if let Some(old) = self.variance.get(&symbol) {
+            return if old == &args {
+                Ok(())
+            } else {
+                Err(format!("conflicting variance declaration for {symbol}"))
+            };
+        }
+        if self
+            .nodes
+            .keys()
+            .any(|node| node.0 == symbol && node.1.len() != args.len())
+        {
+            return Err(format!("existing {symbol} node has a different arity"));
+        }
+        self.variance.insert(symbol, args);
+        Ok(())
     }
     pub fn statistics(&self) -> (usize, usize) {
         (self.rev.len(), self.nodes.len())
@@ -72,8 +164,235 @@ impl EGraph {
         before != (self.nodes.len(), self.uf.n_classes())
     }
 
+    fn propagate_variance(&mut self) -> bool {
+        if self.variance.is_empty() {
+            return false;
+        }
+        let start = Instant::now();
+        let mut profile = VarianceProfile::default();
+        let changed = match self.variance_strategy {
+            VarianceStrategy::Eager => self.propagate_variance_eager(&mut profile),
+            VarianceStrategy::Cartesian => self.propagate_variance_cartesian(&mut profile),
+            VarianceStrategy::Pairwise => self.propagate_variance_pairwise(&mut profile),
+        };
+        self.variance_profile.time += start.elapsed();
+        self.variance_profile.candidates += profile.candidates;
+        self.variance_profile.edges_added += profile.edges_added;
+        changed
+    }
+
+    fn propagate_variance_eager(&mut self, profile: &mut VarianceProfile) -> bool {
+        let before_nodes = self.nodes.len();
+        let nodes: Vec<_> = self
+            .rev
+            .iter()
+            .flat_map(|(&class, nodes)| nodes.iter().map(move |node| (class, node.clone())))
+            .filter(|(_, node)| {
+                self.variance
+                    .get(&node.0)
+                    .is_some_and(|v| v.len() == node.1.len())
+            })
+            .collect();
+        let mut new_order = false;
+        for (class, node) in nodes {
+            for (index, variance) in self.variance[&node.0].clone().into_iter().enumerate() {
+                if variance == Variance::Invariant {
+                    continue;
+                }
+                let child = self.uf.find(node.1[index]);
+                for lower in self.uf.direct_lower(child) {
+                    profile.candidates += 1;
+                    let added = self.variance_neighbor(class, &node, index, variance, lower, false);
+                    profile.edges_added += u64::from(added);
+                    new_order |= added;
+                }
+                for upper in self.uf.direct_upper(child) {
+                    profile.candidates += 1;
+                    let added = self.variance_neighbor(class, &node, index, variance, upper, true);
+                    profile.edges_added += u64::from(added);
+                    new_order |= added;
+                }
+            }
+        }
+
+        new_order || self.nodes.len() != before_nodes
+    }
+
+    fn add_existing_order_edge(
+        &mut self,
+        lower: Id,
+        upper: Id,
+        profile: &mut VarianceProfile,
+    ) -> bool {
+        let added = self.uf.assert_le_edge(lower, upper);
+        self.needs_rebuild |= added;
+        profile.edges_added += u64::from(added);
+        added
+    }
+
+    fn propagate_variance_pairwise(&mut self, profile: &mut VarianceProfile) -> bool {
+        let mut groups: FxHashMap<Symbol, Vec<(Id, Node)>> = FxHashMap::default();
+        for (node, &class) in &self.nodes {
+            if self
+                .variance
+                .get(&node.0)
+                .is_some_and(|v| v.len() == node.1.len())
+            {
+                groups
+                    .entry(node.0)
+                    .or_default()
+                    .push((class, node.clone()));
+            }
+        }
+        let mut changed = false;
+        for (symbol, nodes) in groups {
+            let signature = self.variance[&symbol].clone();
+            for (lower_class, lower) in &nodes {
+                for (upper_class, upper) in &nodes {
+                    if self.uf.are_eq(*lower_class, *upper_class) {
+                        continue;
+                    }
+                    profile.candidates += 1;
+                    let ordered =
+                        signature
+                            .iter()
+                            .enumerate()
+                            .all(|(index, variance)| match variance {
+                                Variance::Covariant => {
+                                    self.uf.is_le(lower.1[index], upper.1[index])
+                                }
+                                Variance::Contravariant => {
+                                    self.uf.is_le(upper.1[index], lower.1[index])
+                                }
+                                Variance::Invariant => {
+                                    self.uf.are_eq(lower.1[index], upper.1[index])
+                                }
+                            });
+                    if ordered {
+                        changed |=
+                            self.add_existing_order_edge(*lower_class, *upper_class, profile);
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    fn propagate_variance_cartesian(&mut self, profile: &mut VarianceProfile) -> bool {
+        let nodes: Vec<_> = self
+            .nodes
+            .iter()
+            .filter(|(node, _)| {
+                self.variance
+                    .get(&node.0)
+                    .is_some_and(|v| v.len() == node.1.len())
+            })
+            .map(|(node, &class)| (class, node.clone()))
+            .collect();
+        let mut uppers = FxHashMap::default();
+        let mut lowers = FxHashMap::default();
+        let mut changed = false;
+        for (class, node) in nodes {
+            let mut choices = Vec::with_capacity(node.1.len());
+            for (child, variance) in node.1.iter().zip(&self.variance[&node.0]) {
+                let child = self.uf.find(*child);
+                let options = match variance {
+                    Variance::Covariant => uppers
+                        .entry(child)
+                        .or_insert_with(|| self.uf.upper_set(child))
+                        .clone(),
+                    Variance::Contravariant => lowers
+                        .entry(child)
+                        .or_insert_with(|| self.uf.lower_set(child))
+                        .clone(),
+                    Variance::Invariant => vec![child],
+                };
+                choices.push(options);
+            }
+            let mut args = node.1.clone();
+            changed |= self.lookup_variance_product(class, node.0, &choices, 0, &mut args, profile);
+        }
+        changed
+    }
+
+    fn lookup_variance_product(
+        &mut self,
+        source: Id,
+        symbol: Symbol,
+        choices: &[Vec<Id>],
+        index: usize,
+        args: &mut Vec<Id>,
+        profile: &mut VarianceProfile,
+    ) -> bool {
+        if index == choices.len() {
+            profile.candidates += 1;
+            if let Some(&target) = self.nodes.get(&Node(symbol, args.clone())) {
+                return self.add_existing_order_edge(source, target, profile);
+            }
+            return false;
+        }
+        let mut changed = false;
+        for &child in &choices[index] {
+            args[index] = child;
+            changed |=
+                self.lookup_variance_product(source, symbol, choices, index + 1, args, profile);
+        }
+        changed
+    }
+
+    fn variance_neighbor(
+        &mut self,
+        class: Id,
+        node: &Node,
+        index: usize,
+        variance: Variance,
+        child: Id,
+        is_upper: bool,
+    ) -> bool {
+        let mut variant = node.clone();
+        variant.1[index] = child;
+        let other = self.add_node(variant);
+        let changed = match (variance, is_upper) {
+            (Variance::Covariant, true) | (Variance::Contravariant, false) => {
+                self.uf.assert_le_edge(class, other)
+            }
+            (Variance::Covariant, false) | (Variance::Contravariant, true) => {
+                self.uf.assert_le_edge(other, class)
+            }
+            (Variance::Invariant, _) => unreachable!(),
+        };
+        self.needs_rebuild |= changed;
+        changed
+    }
+
     /// Pick the smallest finite term in a class. Cycles are skipped.
     pub fn extract(&self, id: Id) -> Option<Sexp> {
+        self.best_terms()
+            .get(&self.uf.find(id))
+            .map(|(_, term)| term.clone())
+    }
+
+    /// Pick the smallest term from any class known to be <= this class.
+    pub fn extract_le(&self, id: Id) -> Option<Sexp> {
+        let best = self.best_terms();
+        self.lower_classes(id)
+            .iter()
+            .filter_map(|class| best.get(class))
+            .min_by_key(|(cost, _)| *cost)
+            .map(|(_, term)| term.clone())
+    }
+
+    /// Pick the smallest term from any class known to be >= this class.
+    pub fn extract_ge(&self, id: Id) -> Option<Sexp> {
+        let best = self.best_terms();
+        self.upper_classes(id)
+            .iter()
+            .filter_map(|class| best.get(class))
+            .min_by_key(|(cost, _)| *cost)
+            .map(|(_, term)| term.clone())
+    }
+
+    fn best_terms(&self) -> IndexMap<Id, (usize, Sexp)> {
         let mut best: IndexMap<Id, (usize, Sexp)> = IndexMap::default();
         loop {
             let mut changed = false;
@@ -109,13 +428,18 @@ impl EGraph {
                 break;
             }
         }
-        best.get(&self.uf.find(id)).map(|(_, term)| term.clone())
+        best
     }
 
     pub fn add_node(&mut self, node: Node) -> Id {
         let node = self.canonicalize_node(&node);
-        let id = *self.nodes.entry(node).or_insert_with(|| self.uf.mkset());
-        self.uf.find_mut(id)
+        if let Some(&id) = self.nodes.get(&node) {
+            return self.uf.find_mut(id);
+        }
+        let id = self.uf.mkset();
+        self.nodes.insert(node, id);
+        self.needs_rebuild = true;
+        id
     }
 
     /// Parse and add an s-exp in one step, useful for testing
@@ -124,7 +448,9 @@ impl EGraph {
     }
 
     pub fn union(&mut self, a: Id, b: Id) -> bool {
-        self.uf.union(a, b)
+        let changed = self.uf.union(a, b);
+        self.needs_rebuild |= changed;
+        changed
     }
 
     pub fn nodes_in_class(&self, class: Id) -> impl Iterator<Item = &Node> {
@@ -144,6 +470,9 @@ impl EGraph {
     }
 
     pub fn rebuild(&mut self) {
+        if !self.needs_rebuild {
+            return;
+        }
         let mut keep_going = true;
         while keep_going {
             keep_going = false;
@@ -156,7 +485,11 @@ impl EGraph {
                     keep_going = true;
                 }
             }
+            if self.uf.collapse_order_cycle() {
+                keep_going = true;
+            }
         }
+        self.uf.rebuild_closure();
 
         // rebuild the reverse map from scratch
         self.rev.clear();
@@ -164,6 +497,7 @@ impl EGraph {
             self.rev.entry(*id).or_default().push(node.clone());
         }
         self.rev.sort_keys();
+        self.needs_rebuild = false;
 
         if cfg!(debug_assertions) {
             // nodes in nodes are canonical
@@ -207,11 +541,70 @@ impl EGraph {
 
 // e-matching
 // we will reuse sexps as patterns, where atoms starting with ? are treated as pattern variables
+#[derive(Clone, Copy)]
+enum MatchDirection {
+    Exact,
+    Above,
+    Below,
+}
+
+impl MatchDirection {
+    fn in_argument(self, variance: Variance) -> Self {
+        match variance {
+            Variance::Covariant => self,
+            Variance::Contravariant => match self {
+                Self::Above => Self::Below,
+                Self::Below => Self::Above,
+                Self::Exact => Self::Exact,
+            },
+            Variance::Invariant => Self::Exact,
+        }
+    }
+}
+
 impl EGraph {
     pub fn ematch(&self, pat: &Sexp, class: Id) -> Vec<Subst> {
         self.ematch_rec(pat, class, Default::default())
     }
     pub fn ematch_rec(&self, pat: &Sexp, class: Id, subst: Subst) -> Vec<Subst> {
+        self.ematch_direction(pat, class, subst, MatchDirection::Exact)
+    }
+
+    /// Find substitutions for which `class <= pat[subst]`.
+    pub fn ematch_above(&self, pat: &Sexp, class: Id) -> Vec<Subst> {
+        self.ematch_direction(pat, class, Default::default(), MatchDirection::Above)
+    }
+
+    /// Find substitutions for which `pat[subst] <= class`.
+    pub fn ematch_below(&self, pat: &Sexp, class: Id) -> Vec<Subst> {
+        self.ematch_direction(pat, class, Default::default(), MatchDirection::Below)
+    }
+
+    fn ematch_direction(
+        &self,
+        pat: &Sexp,
+        class: Id,
+        subst: Subst,
+        direction: MatchDirection,
+    ) -> Vec<Subst> {
+        let classes = match direction {
+            MatchDirection::Exact => vec![self.uf.find(class)],
+            MatchDirection::Above => self.upper_classes(class),
+            MatchDirection::Below => self.lower_classes(class),
+        };
+        classes
+            .into_iter()
+            .flat_map(|candidate| self.ematch_in_class(pat, candidate, subst.clone(), direction))
+            .collect()
+    }
+
+    fn ematch_in_class(
+        &self,
+        pat: &Sexp,
+        class: Id,
+        subst: Subst,
+        direction: MatchDirection,
+    ) -> Vec<Subst> {
         match pat {
             Sexp::Atom(name) => {
                 // all atoms beginning with ? are treated as pattern variables
@@ -231,10 +624,20 @@ impl EGraph {
                     .filter(|node| (node.0, node.1.len()) == (*f, args.len()))
                     .flat_map(|node| {
                         let init = vec![subst.clone()];
-                        args.iter().zip(&node.1).fold(init, |todo, (pa, &na)| {
-                            let rec = |subst| self.ematch_rec(pa, na, subst);
-                            todo.into_iter().flat_map(rec).collect()
-                        })
+                        args.iter()
+                            .zip(&node.1)
+                            .enumerate()
+                            .fold(init, |todo, (i, (pa, &na))| {
+                                let variance = self
+                                    .variance
+                                    .get(f)
+                                    .map(|signature| signature[i])
+                                    .unwrap_or(Variance::Invariant);
+                                let child_direction = direction.in_argument(variance);
+                                let rec =
+                                    |subst| self.ematch_direction(pa, na, subst, child_direction);
+                                todo.into_iter().flat_map(rec).collect()
+                            })
                     })
                     .collect()
             }
@@ -246,6 +649,47 @@ pub type Rewrite = (Sexp, Sexp);
 
 // rewriting, rebuilding
 impl EGraph {
+    /// Apply equality, `<=`, and `>=` rewrites to the same graph snapshot.
+    pub fn rewrite_step_with_order(
+        &mut self,
+        rewrites: &[Rewrite],
+        le_rewrites: &[Rewrite],
+        ge_rewrites: &[Rewrite],
+    ) -> bool {
+        self.rebuild();
+        let before = (self.nodes.len(), self.uf.n_classes());
+        let equalities = self.collect_matches(rewrites);
+        let less_than = self.collect_order_matches(le_rewrites, MatchDirection::Above);
+        let greater_than = self.collect_order_matches(ge_rewrites, MatchDirection::Below);
+        let unions = self.apply_matches(equalities);
+        let mut new_order = false;
+        for (rhs, class, matches) in less_than {
+            for subst in matches {
+                let upper = self.instantiate(rhs, &subst);
+                new_order |= self.assert_le(class, upper);
+            }
+        }
+        for (rhs, class, matches) in greater_than {
+            for subst in matches {
+                let lower = self.instantiate(rhs, &subst);
+                new_order |= self.assert_le(lower, class);
+            }
+        }
+        if unions != 0 || new_order || self.nodes.len() != before.0 {
+            self.rebuild();
+        }
+        let variance_change = self.propagate_variance();
+        if variance_change {
+            self.rebuild();
+        }
+        new_order || variance_change || before != (self.nodes.len(), self.uf.n_classes())
+    }
+
+    /// Apply equality rewrites and `<=` rewrites.
+    pub fn refinement_step(&mut self, rewrites: &[Rewrite], refinements: &[Rewrite]) -> bool {
+        self.rewrite_step_with_order(rewrites, refinements, &[])
+    }
+
     pub fn instantiate(&mut self, pattern: &Sexp, subst: &Subst) -> Id {
         match pattern {
             Sexp::Atom(name) if name.as_str().starts_with('?') => subst[*name],
@@ -273,6 +717,23 @@ impl EGraph {
                 let matches = self.ematch(&rw.0, class);
                 if !matches.is_empty() {
                     all_matches.push((&rw.1, class, matches));
+                }
+            }
+        }
+        all_matches
+    }
+
+    fn collect_order_matches<'a>(
+        &self,
+        rules: &'a [Rewrite],
+        direction: MatchDirection,
+    ) -> Vec<(&'a Sexp, Id, Vec<Subst>)> {
+        let mut all_matches = vec![];
+        for (lhs, rhs) in rules {
+            for &class in self.rev.keys() {
+                let matches = self.ematch_direction(lhs, class, Default::default(), direction);
+                if !matches.is_empty() {
+                    all_matches.push((rhs, class, matches));
                 }
             }
         }
@@ -389,4 +850,237 @@ fn test_ac_rewriting() {
     assert!(eg.uf.are_eq(input, goal));
 
     assert_eq!(eg.uf.n_classes(), 2usize.pow(n as _) - 1);
+}
+
+#[test]
+fn existing_node_variance_closes_all_arguments_without_new_enodes() {
+    for strategy in [VarianceStrategy::Cartesian, VarianceStrategy::Pairwise] {
+        let mut eg = EGraph::default();
+        eg.set_variance_strategy(strategy);
+        eg.declare_variance("f".into(), vec![Variance::Covariant, Variance::Covariant])
+            .unwrap();
+        let a = eg.add("a");
+        let b = eg.add("b");
+        eg.assert_le(a, b);
+        let lower = eg.add("(f (f a a) a)");
+        let upper = eg.add("(f (f b b) b)");
+        for _ in 0..5 {
+            if !eg.refinement_step(&[], &[]) {
+                break;
+            }
+        }
+        assert!(eg.is_le(lower, upper), "{strategy:?}");
+        assert_eq!(eg.statistics(), (6, 6), "{strategy:?}");
+    }
+}
+
+#[test]
+fn existing_node_variance_respects_contravariance() {
+    for strategy in [VarianceStrategy::Cartesian, VarianceStrategy::Pairwise] {
+        let mut eg = EGraph::default();
+        eg.set_variance_strategy(strategy);
+        eg.declare_variance(
+            "f".into(),
+            vec![Variance::Covariant, Variance::Contravariant],
+        )
+        .unwrap();
+        let a = eg.add("a");
+        let b = eg.add("b");
+        eg.assert_le(a, b);
+        let lower = eg.add("(f a b)");
+        let upper = eg.add("(f b a)");
+        for _ in 0..3 {
+            if !eg.refinement_step(&[], &[]) {
+                break;
+            }
+        }
+        assert!(eg.is_le(lower, upper), "{strategy:?}");
+        assert!(!eg.is_le(upper, lower), "{strategy:?}");
+        assert_eq!(eg.statistics(), (4, 4), "{strategy:?}");
+    }
+}
+
+#[test]
+fn refinement_matches_a_covariant_child_without_materializing_it() {
+    let mut eg = EGraph::default();
+    eg.set_variance_strategy(VarianceStrategy::Pairwise);
+    eg.declare_variance("f".into(), vec![Variance::Covariant])
+        .unwrap();
+    let a = eg.add("a");
+    let b = eg.add("b");
+    eg.assert_le(a, b);
+    let target = eg.add("(f a)");
+    let refinements = [(sexp("(f b)"), sexp("z"))];
+
+    eg.refinement_step(&[], &refinements);
+
+    let z = eg.nodes[&Node("z".into(), vec![])];
+    assert!(eg.is_le(target, z));
+    assert!(!eg.nodes.contains_key(&Node("f".into(), vec![b])));
+    assert!(eg.ematch_below(&sexp("(f b)"), target).is_empty());
+}
+
+#[test]
+fn refinement_matching_flips_in_a_contravariant_child() {
+    let mut eg = EGraph::default();
+    eg.set_variance_strategy(VarianceStrategy::Pairwise);
+    eg.declare_variance("f".into(), vec![Variance::Contravariant])
+        .unwrap();
+    let a = eg.add("a");
+    let b = eg.add("b");
+    eg.assert_le(a, b);
+    let target = eg.add("(f b)");
+    let refinements = [(sexp("(f a)"), sexp("z"))];
+
+    eg.refinement_step(&[], &refinements);
+
+    let z = eg.nodes[&Node("z".into(), vec![])];
+    assert!(eg.is_le(target, z));
+    assert!(!eg.nodes.contains_key(&Node("f".into(), vec![a])));
+}
+
+#[test]
+fn refinement_matching_requires_equality_in_an_invariant_child() {
+    let mut eg = EGraph::default();
+    eg.set_variance_strategy(VarianceStrategy::Pairwise);
+    eg.declare_variance("f".into(), vec![Variance::Invariant])
+        .unwrap();
+    let a = eg.add("a");
+    let b = eg.add("b");
+    eg.assert_le(a, b);
+    let target = eg.add("(f a)");
+    let refinements = [(sexp("(f b)"), sexp("z"))];
+
+    eg.refinement_step(&[], &refinements);
+    assert!(!eg.nodes.contains_key(&Node("z".into(), vec![])));
+
+    eg.union(a, b);
+    eg.refinement_step(&[], &refinements);
+    let z = eg.nodes[&Node("z".into(), vec![])];
+    assert!(eg.is_le(target, z));
+}
+
+#[test]
+fn refinement_matching_searches_upper_eclasses() {
+    let mut eg = EGraph::default();
+    eg.set_variance_strategy(VarianceStrategy::Pairwise);
+    let a = eg.add("a");
+    let b = eg.add("b");
+    eg.assert_le(a, b);
+
+    assert_eq!(eg.ematch_below(&sexp("a"), b).len(), 1);
+
+    eg.refinement_step(&[], &[(sexp("b"), sexp("z"))]);
+
+    let z = eg.nodes[&Node("z".into(), vec![])];
+    assert!(eg.is_le(a, z));
+}
+
+#[test]
+fn existing_node_variance_does_not_match_unmaterialized_rewrite_terms() {
+    let run = |strategy| {
+        let mut eg = EGraph::default();
+        eg.set_variance_strategy(strategy);
+        eg.declare_variance("f".into(), vec![Variance::Covariant])
+            .unwrap();
+        let a = eg.add("a");
+        let b = eg.add("b");
+        eg.assert_le(a, b);
+        eg.add("(f a)");
+        let rewrites = [(sexp("(f b)"), sexp("c"))];
+        for _ in 0..5 {
+            if !eg.refinement_step(&rewrites, &[]) {
+                break;
+            }
+        }
+        eg.nodes.contains_key(&Node("c".into(), vec![]))
+    };
+    assert!(run(VarianceStrategy::Eager));
+    assert!(!run(VarianceStrategy::Cartesian));
+    assert!(!run(VarianceStrategy::Pairwise));
+}
+
+#[test]
+fn variance_strategies_agree_on_existing_ac_terms() {
+    fn saturated(strategy: VarianceStrategy) -> EGraph {
+        let mut eg = EGraph::default();
+        eg.set_variance_strategy(strategy);
+        let atoms: Vec<_> = (0..=4).map(|i| format!("x{i}")).collect();
+        let fold = |terms: &[String]| {
+            terms
+                .iter()
+                .cloned()
+                .reduce(|left, right| format!("(U {left} {right})"))
+                .unwrap()
+        };
+        eg.add(&fold(&atoms[..4]));
+        eg.declare_variance("U".into(), vec![Variance::Covariant; 2])
+            .unwrap();
+        for pair in atoms.windows(2) {
+            let lower = eg.add(&pair[0]);
+            let upper = eg.add(&pair[1]);
+            eg.assert_le(lower, upper);
+        }
+        let mut goal = atoms[1..].to_vec();
+        goal.reverse();
+        eg.add(&fold(&goal));
+        let rewrites = [
+            (sexp("(U (U ?x ?y) ?z)"), sexp("(U ?x (U ?y ?z))")),
+            (sexp("(U ?x ?y)"), sexp("(U ?y ?x)")),
+        ];
+        for _ in 0..30 {
+            if !eg.refinement_step(&rewrites, &[]) {
+                return eg;
+            }
+        }
+        panic!("strategy did not saturate: {strategy:?}");
+    }
+    let eager = saturated(VarianceStrategy::Eager);
+    let cartesian = saturated(VarianceStrategy::Cartesian);
+    let pairwise = saturated(VarianceStrategy::Pairwise);
+    fn signature(term: &Sexp, leaves: &mut Vec<String>) {
+        match term {
+            Sexp::Atom(atom) => leaves.push(atom.to_string()),
+            Sexp::List(items) => {
+                for arg in &items[1..] {
+                    signature(arg, leaves);
+                }
+            }
+        }
+    }
+    fn classes(eg: &EGraph) -> std::collections::BTreeMap<Vec<String>, Id> {
+        eg.best_terms()
+            .into_iter()
+            .map(|(class, (_, term))| {
+                let mut leaves = Vec::new();
+                signature(&term, &mut leaves);
+                leaves.sort();
+                (leaves, class)
+            })
+            .collect()
+    }
+    let eager_classes = classes(&eager);
+    let cartesian_classes = classes(&cartesian);
+    let pairwise_classes = classes(&pairwise);
+    assert_eq!(
+        cartesian_classes.keys().collect::<Vec<_>>(),
+        pairwise_classes.keys().collect::<Vec<_>>()
+    );
+    for (left, &cart_left) in &cartesian_classes {
+        let eager_left = eager_classes[left];
+        let pair_left = pairwise_classes[left];
+        for (right, &cart_right) in &cartesian_classes {
+            let expected = eager.is_le(eager_left, eager_classes[right]);
+            assert_eq!(
+                cartesian.is_le(cart_left, cart_right),
+                expected,
+                "cartesian disagrees on {left:?} <= {right:?}"
+            );
+            assert_eq!(
+                pairwise.is_le(pair_left, pairwise_classes[right]),
+                expected,
+                "pairwise disagrees on {left:?} <= {right:?}"
+            );
+        }
+    }
 }

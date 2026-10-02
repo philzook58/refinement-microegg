@@ -1,6 +1,6 @@
 //! The non-binder subset of lambda-microegg's command language.
 use crate::util::{Sexp, Symbol};
-use crate::{EGraph, Rewrite};
+use crate::{EGraph, Rewrite, Variance};
 
 pub fn parse(input: &str) -> Result<Vec<Sexp>, String> {
     struct Parser<'a> {
@@ -201,6 +201,8 @@ pub fn run(input: &str) -> Result<Vec<String>, String> {
 fn run_forms(forms: &[Sexp]) -> Result<Vec<String>, String> {
     let mut eg = EGraph::default();
     let mut rewrites: Vec<Rewrite> = Vec::new();
+    let mut le_rewrites: Vec<Rewrite> = Vec::new();
+    let mut ge_rewrites: Vec<Rewrite> = Vec::new();
     let mut output = Vec::new();
     for (index, form) in forms.iter().enumerate() {
         let result: Result<(), String> = (|| {
@@ -226,24 +228,84 @@ fn run_forms(forms: &[Sexp]) -> Result<Vec<String>, String> {
                     arity(0)?;
                     eg = EGraph::default();
                     rewrites.clear();
+                    le_rewrites.clear();
+                    ge_rewrites.clear();
                 }
                 "insert" => {
                     arity(1)?;
                     term(&args[0], false)?;
                     eg.instantiate(&args[0], &Default::default());
                 }
-                "union" | "guard" => {
+                "union" | "guard" | "le" | "guard-le" => {
                     arity(2)?;
                     term(&args[0], false)?;
                     term(&args[1], false)?;
                     let a = eg.instantiate(&args[0], &Default::default());
                     let b = eg.instantiate(&args[1], &Default::default());
-                    if name == "union" {
-                        eg.union(a, b);
-                        eg.rebuild();
-                    } else if !eg.equivalent(a, b) {
-                        return Err(format!("guard failed: {} != {}", args[0], args[1]));
+                    match name {
+                        "union" => {
+                            eg.union(a, b);
+                            eg.rebuild();
+                        }
+                        "le" => {
+                            eg.assert_le(a, b);
+                            eg.rebuild();
+                        }
+                        "guard" => {
+                            eg.rebuild();
+                            if !eg.equivalent(a, b) {
+                                return Err(format!("guard failed: {} != {}", args[0], args[1]));
+                            }
+                        }
+                        "guard-le" => {
+                            eg.rebuild();
+                            if !eg.is_le(a, b) {
+                                return Err(format!(
+                                    "guard-le failed: {} <= {} is not known",
+                                    args[0], args[1]
+                                ));
+                            }
+                        }
+                        _ => unreachable!(),
                     }
+                }
+                "rewrite-le" | "rewrite-ge" => {
+                    arity(2)?;
+                    term(&args[0], true)?;
+                    term(&args[1], true)?;
+                    let mut bound = Vec::new();
+                    let mut used = Vec::new();
+                    variables(&args[0], &mut bound);
+                    variables(&args[1], &mut used);
+                    if used.iter().any(|variable| !bound.contains(variable)) {
+                        return Err(format!("{name} RHS has an unbound pattern variable"));
+                    }
+                    let rules = if name == "rewrite-le" {
+                        &mut le_rewrites
+                    } else {
+                        &mut ge_rewrites
+                    };
+                    rules.push((args[0].clone(), args[1].clone()));
+                }
+                "fun" => {
+                    arity(2)?;
+                    let symbol = atom(&args[0])?;
+                    if symbol.starts_with('?') {
+                        return Err("fun expects an operator name".into());
+                    }
+                    let Sexp::List(positions) = &args[1] else {
+                        return Err("fun expects a variance list, such as (+ - =)".into());
+                    };
+                    let mut signature = Vec::new();
+                    for position in positions {
+                        signature.push(match atom(position)? {
+                            "+" => Variance::Covariant,
+                            "-" => Variance::Contravariant,
+                            "=" => Variance::Invariant,
+                            other => return Err(format!("unknown variance '{other}'")),
+                        });
+                    }
+                    eg.declare_variance(symbol.into(), signature)?;
                 }
                 "rewrite" | "birewrite" => {
                     arity(2)?;
@@ -270,10 +332,17 @@ fn run_forms(forms: &[Sexp]) -> Result<Vec<String>, String> {
                         .parse()
                         .map_err(|_| "run expects a nonnegative integer".to_string())?;
                     for _ in 0..limit {
-                        if !eg.rewrite_step(&rewrites) {
+                        if !eg.rewrite_step_with_order(&rewrites, &le_rewrites, &ge_rewrites) {
                             break;
                         }
                     }
+                }
+                "refinement-closure" => {
+                    arity(1)?;
+                    let limit: usize = atom(&args[0])?.parse().map_err(|_| {
+                        "refinement-closure expects a nonnegative integer".to_string()
+                    })?;
+                    eg.refinement_closure(limit);
                 }
                 "match" => {
                     arity(1)?;
@@ -281,12 +350,22 @@ fn run_forms(forms: &[Sexp]) -> Result<Vec<String>, String> {
                     eg.rebuild();
                     output.push(format!("{} matches", eg.match_count(&args[0])));
                 }
-                "extract" => {
+                "extract" | "extract-le" | "extract-ge" => {
                     arity(1)?;
                     term(&args[0], false)?;
                     let id = eg.instantiate(&args[0], &Default::default());
                     eg.rebuild();
-                    output.push(eg.extract(id).ok_or("no finite term in class")?.to_string());
+                    let result = match name {
+                        "extract" => eg.extract(id),
+                        "extract-le" => eg.extract_le(id),
+                        "extract-ge" => eg.extract_ge(id),
+                        _ => unreachable!(),
+                    };
+                    output.push(
+                        result
+                            .ok_or("no finite term in eligible classes")?
+                            .to_string(),
+                    );
                 }
                 "echo" => {
                     arity(1)?;
@@ -333,11 +412,154 @@ mod tests {
         );
     }
     #[test]
+    fn reset_clears_order_rewrites() {
+        run(
+            "(rewrite-le A B) (rewrite-ge A C) (reset) (insert A) (run 2)
+             (fail (guard-le A B)) (fail (guard-le C A))",
+        )
+        .unwrap();
+    }
+    #[test]
+    fn refinement_is_directional_and_transitive() {
+        run("(insert (inter A B))
+             (rewrite-le (inter ?a ?b) ?a)
+             (le A Top)
+             (run 2)
+             (guard-le (inter A B) A)
+             (guard-le (inter A B) Top)
+             (fail (guard-le A (inter A B)))")
+        .unwrap();
+    }
+    #[test]
+    fn refinement_constructs_its_right_hand_term() {
+        run("(insert (f A))
+             (rewrite-le (f ?x) (g ?x))
+             (run 2)
+             (guard-le (f A) (g A))
+             (fail (guard (f A) (g A)))")
+        .unwrap();
+    }
+    #[test]
+    fn refinement_matches_upward_in_one_round() {
+        run("(fun f (+))
+             (le a b)
+             (insert (f a))
+             (rewrite-le (f b) z)
+             (run 1)
+             (guard-le (f a) z)")
+        .unwrap();
+    }
+    #[test]
+    fn rewrite_ge_matches_downward_in_one_round() {
+        run("(fun f (+))
+             (le a b)
+             (insert (f b))
+             (rewrite-ge (f a) z)
+             (run 1)
+             (guard-le z (f b))")
+        .unwrap();
+        run("(fun f (-))
+             (le a b)
+             (insert (f a))
+             (rewrite-ge (f b) z)
+             (run 1)
+             (guard-le z (f a))")
+        .unwrap();
+    }
+    #[test]
+    fn dontcare_circuit_extracts_a_deterministic_refinement() {
+        assert_eq!(run(include_str!("examples/dontcare.sexp")).unwrap(), ["x"]);
+    }
+    #[test]
+    fn extraction_follows_both_order_directions() {
+        assert_eq!(
+            run("(le a (f x)) (le (f x) b)
+                 (extract (f x)) (extract-le (f x)) (extract-ge (f x))")
+            .unwrap(),
+            ["(f x)", "a", "b"]
+        );
+    }
+    #[test]
+    fn variance_signs_propagate_in_the_expected_directions() {
+        run("(le a b)
+             (fun cov (+)) (fun contra (-)) (fun inv (=))
+             (insert (cov a)) (insert (contra a)) (insert (inv a))
+             (refinement-closure 3)
+             (guard-le (cov a) (cov b))
+             (guard-le (contra b) (contra a))
+             (fail (guard-le (inv a) (inv b)))")
+        .unwrap();
+    }
+    #[test]
+    fn direct_variance_edges_reach_transitive_nested_goal() {
+        run("(le a b) (le b c)
+             (fun f (+ +))
+             (insert (f (f a a) a))
+             (insert (f (f c c) c))
+             (run 12)
+             (guard-le (f (f a a) a) (f (f c c) c))")
+        .unwrap();
+    }
+    #[test]
+    fn variance_propagates_edges_added_after_an_earlier_run() {
+        run("(fun f (+)) (insert (f a)) (run 2)
+             (le a b) (refinement-closure 3) (guard-le (f a) (f b))")
+        .unwrap();
+    }
+    #[test]
+    fn variance_propagates_after_child_classes_merge() {
+        run("(fun f (+)) (insert (f a)) (insert (f b)) (run 2)
+             (union a b) (le b c) (refinement-closure 3) (guard-le (f a) (f c))")
+        .unwrap();
+    }
+    #[test]
+    fn explicit_refinement_closure_materializes_missing_enodes() {
+        assert_eq!(
+            run("(fun f (+)) (le a b) (insert (f a))
+                 (rewrite (f b) z)
+                 (run 2) (match (f b))
+                 (refinement-closure 3) (match (f b)) (match z)
+                 (run 1) (match z)
+                 (le b c) (run 2) (match (f c))")
+            .unwrap(),
+            [
+                "0 matches",
+                "1 matches",
+                "0 matches",
+                "1 matches",
+                "0 matches"
+            ]
+        );
+    }
+    #[test]
+    fn refinement_closure_limit_stops_cyclic_growth() {
+        assert_eq!(
+            run("(fun f (+)) (union a (f a)) (le a b)
+                 (refinement-closure 3)
+                 (match (f (f (f b))))
+                 (match (f (f (f (f b)))))")
+            .unwrap(),
+            ["1 matches", "0 matches"]
+        );
+    }
+    #[test]
+    fn order_cycle_becomes_equality_and_rebuilds_congruence() {
+        run("(insert (f A)) (insert (f B))
+             (le A B) (le B A)
+             (guard A B) (guard (f A) (f B))")
+        .unwrap();
+    }
+    #[test]
     fn rejects_bad_input() {
         assert!(run("(insert (@lam x x))").is_err());
         assert!(run("(rewrite ?x ?y)").is_err());
         assert!(run("(insert (f x]").is_err());
         assert!(run("(insert a) (fail (guard a b))").is_ok());
         assert!(run("(insert a) (fail (guard a a))").is_err());
+        assert!(run("(rewrite-le (f ?x) ?y)").is_err());
+        assert!(run("(rewrite-ge (f ?x) ?y)").is_err());
+        assert!(run("(refine a b)").is_err());
+        assert!(run("(refinement-closure)").is_err());
+        assert!(run("(fun f (+)) (fun f (-))").is_err());
     }
 }

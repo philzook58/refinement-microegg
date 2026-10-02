@@ -1,0 +1,15 @@
+; AC equality and covariant set union over a chain of inclusions.
+; All union nodes are binary. Both sides of the goal exist before run.
+(le x0 x1)
+(le x1 x2)
+(le x2 x3)
+(le x3 x4)
+(fun U (+ +))
+(insert (U (U (U x0 x1) x2) x3))
+(insert (U (U (U x4 x3) x2) x1))
+(rewrite (U (U ?x ?y) ?z) (U ?x (U ?y ?z)))
+(rewrite (U ?x ?y) (U ?y ?x))
+(run 20)
+(guard-le (U (U (U x0 x1) x2) x3)
+          (U (U (U x4 x3) x2) x1))
+(echo "AC and order passed")
