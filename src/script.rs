@@ -270,19 +270,23 @@ fn run_forms(forms: &[Sexp]) -> Result<Vec<String>, String> {
                     term(&args[0], false)?;
                     eg.instantiate(&args[0], &Default::default());
                 }
-                "union" | "guard" | "le" | "guard-le" => {
+                "union" | "=" | "guard" | "le" | "<=" | "ge" | ">=" | "guard-le" => {
                     arity(2)?;
                     term(&args[0], false)?;
                     term(&args[1], false)?;
                     let a = eg.instantiate(&args[0], &Default::default());
                     let b = eg.instantiate(&args[1], &Default::default());
                     match name {
-                        "union" => {
+                        "union" | "=" => {
                             eg.union(a, b);
                             eg.rebuild();
                         }
-                        "le" => {
+                        "le" | "<=" => {
                             eg.assert_le(a, b);
+                            eg.rebuild();
+                        }
+                        "ge" | ">=" => {
+                            eg.assert_le(b, a);
                             eg.rebuild();
                         }
                         "guard" => {
@@ -513,6 +517,26 @@ mod tests {
              (guard-le (inter A B) A)
              (guard-le (inter A B) Top)
              (fail (guard-le A (inter A B)))")
+        .unwrap();
+    }
+    #[test]
+    fn ge_asserts_the_reverse_order() {
+        run("(ge b a)
+             (guard-le a b)
+             (fail (guard-le b a))
+             (le b a)
+             (guard a b)")
+        .unwrap();
+    }
+    #[test]
+    fn symbolic_order_and_equality_commands() {
+        run("(= a b)
+             (guard a b)
+             (<= b c)
+             (>= d c)
+             (guard-le a c)
+             (guard-le a d)
+             (fail (guard-le d c))")
         .unwrap();
     }
     #[test]

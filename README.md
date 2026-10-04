@@ -25,9 +25,20 @@ Function symbols can be given a variance signature, very similarly to variance o
 
 Refinement rebuilding / closure is no where near as nice as equality (although it is still conceptually simple). It is not obvious that it will terminate if one allows new enode creation, so in that sense it is in the same naughty category as rewrite rules. There is a distinction to be made between materializing and non-materializing refinement closure (only note inequalities between pre-exising enodes).
 
-# Example
+# Circuit Don't Care Example
+
+A nice example is "don't care" in boolean circuits <https://en.wikipedia.org/wiki/Don%27t-care_term> . Some inputs are not expected or allowed, so they optimizer is free to pick a behavior on those inputs that helps make a more optimal circuit.
+
+The intended semantics of this example is `Bool -> Set Bool`. `[[x]] = fun b => {b}` is the lifted identity function. `ite` is pointwise lifted. `[[dontcare]] = fun _ => {True, False}` `[[true]] = fun _ => {True}` `[[false]] = fun _ => {False}`. Refinement is interpreted as subrelation.
 
 ```
+(fun ite (+ + +)) ; declare if-then-else as covariant in all arguments
+(rewrite (ite ?x true false) ?x)  ; ordinary equality rewrite
+(ge dontcare true)    ; dontcare refines to true
+(ge dontcare false)   ; dontcare also refines to false
 
+(insert (ite x true dontcare)) ; insert starting term
+(run 5 :expand-le)
 
+(extract-le (ite x true dontcare))  ; can extract x because refining this dontcare to true enables a nice term
 ```
