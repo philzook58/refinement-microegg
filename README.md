@@ -27,7 +27,7 @@ Refinement rebuilding / closure is no where near as nice as equality (although i
 
 # Circuit Don't Care Example
 
-A nice example is "don't care" in boolean circuits <https://en.wikipedia.org/wiki/Don%27t-care_term> . Some inputs are not expected or allowed, so they optimizer is free to pick a behavior on those inputs that helps make a more optimal circuit.
+A nice example is "don't care" in boolean circuits <https://en.wikipedia.org/wiki/Don%27t-care_term> . Some inputs are not expected or allowed, so they optimizer is free to pick a behavior on those inputs that helps make a more optimal circuit. I believe George Constantinides explained this to me.
 
 The intended semantics of this example is `Bool -> Set Bool`. `[[x]] = fun b => {b}` is the lifted identity function. `ite` is pointwise lifted. `[[dontcare]] = fun _ => {True, False}` `[[true]] = fun _ => {True}` `[[false]] = fun _ => {False}`. Refinement is interpreted as subrelation.
 
