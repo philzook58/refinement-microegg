@@ -1,12 +1,12 @@
 # Refinement MicroEgg
 
-A prototype of a refinement egraph based on Max Willsey's microegg <https://github.com/mwillsey/microegg>
+A prototype of a refinement egraph based on Max Willsey's microegg <https://github.com/mwillsey/microegg>. A WASM demo is here <https://www.philipzucker.com/refinement-microegg>
 
 Refinement e-graphs give you an uninterpreted `<=` that is about as baked in as `=` is.
 
 This is useful perhaps because as the story goes, many rewrites in compilers are not unoriented equalities, they are oriented refinements.
 
-`<=` is transitive, reflexive, and collapses cycles to `=`.
+`<=` is baked in to be transitive, reflexive, and collapses cycles to `=`.
 
 Previous discussions of mine on refinement e-graphs:
 
@@ -41,4 +41,20 @@ The intended semantics of this example is `Bool -> Set Bool`. `[[x]] = fun b => 
 (run 5 :expand-le)
 
 (extract-le (ite x true dontcare))  ; can extract x because refining this dontcare to true enables a nice term
+```
+
+# AI Disclosure
+
+This was produced by giving an agent my notes, Max's microegg, and directions.
+
+# Citing
+
+```
+@software{refinementmicroegg2026,
+  author = {Philip Zucker},
+  title = {{Refinement MicroEgg}},
+  url = {https://github.com/philzook58/refinement-microegg},
+  month = {10},
+  year = {2026}
+}
 ```
