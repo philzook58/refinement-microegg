@@ -1,6 +1,6 @@
 //! The non-binder subset of lambda-microegg's command language.
 use crate::util::{Sexp, Symbol};
-use crate::{EGraph, Rewrite, Variance};
+use crate::{EGraph, Rewrite, Rule, RuleConclusion, RuleFact, Variance, VarianceStrategy};
 
 pub fn parse(input: &str) -> Result<Vec<Sexp>, String> {
     struct Parser<'a> {
@@ -193,6 +193,38 @@ fn variables(form: &Sexp, out: &mut Vec<Symbol>) {
     }
 }
 
+fn rule_fact(form: &Sexp) -> Result<RuleFact, String> {
+    if let Sexp::List(items) = form {
+        if let Some(Sexp::Atom(head)) = items.first() {
+            match head.as_str() {
+                "=" | "<=" | ">=" => {
+                    if items.len() != 3 {
+                        return Err(format!("{head} expects two terms in a rule"));
+                    }
+                    term(&items[1], true)?;
+                    term(&items[2], true)?;
+                    return Ok(match head.as_str() {
+                        "=" => RuleFact::Eq(items[1].clone(), items[2].clone()),
+                        "<=" => RuleFact::Le(items[1].clone(), items[2].clone()),
+                        ">=" => RuleFact::Ge(items[1].clone(), items[2].clone()),
+                        _ => unreachable!(),
+                    });
+                }
+                "Rel" => {
+                    if items.len() != 2 {
+                        return Err("Rel expects one term in a rule".into());
+                    }
+                    term(&items[1], true)?;
+                    return Ok(RuleFact::Rel(items[1].clone()));
+                }
+                _ => {}
+            }
+        }
+    }
+    term(form, true)?;
+    Ok(RuleFact::Rel(form.clone()))
+}
+
 pub fn run(input: &str) -> Result<Vec<String>, String> {
     let forms = parse(input)?;
     run_forms(&forms)
@@ -203,6 +235,7 @@ fn run_forms(forms: &[Sexp]) -> Result<Vec<String>, String> {
     let mut rewrites: Vec<Rewrite> = Vec::new();
     let mut le_rewrites: Vec<Rewrite> = Vec::new();
     let mut ge_rewrites: Vec<Rewrite> = Vec::new();
+    let mut rules: Vec<Rule> = Vec::new();
     let mut output = Vec::new();
     for (index, form) in forms.iter().enumerate() {
         let result: Result<(), String> = (|| {
@@ -230,6 +263,7 @@ fn run_forms(forms: &[Sexp]) -> Result<Vec<String>, String> {
                     rewrites.clear();
                     le_rewrites.clear();
                     ge_rewrites.clear();
+                    rules.clear();
                 }
                 "insert" => {
                     arity(1)?;
@@ -326,15 +360,60 @@ fn run_forms(forms: &[Sexp]) -> Result<Vec<String>, String> {
                         rewrites.push((args[1].clone(), args[0].clone()));
                     }
                 }
+                "rule" => {
+                    arity(2)?;
+                    let Sexp::List(premises) = &args[0] else {
+                        return Err("rule expects a list of premises".into());
+                    };
+                    let premises = premises
+                        .iter()
+                        .map(rule_fact)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let conclusion = match rule_fact(&args[1])? {
+                        RuleFact::Eq(left, right) => RuleConclusion::Eq(left, right),
+                        RuleFact::Le(left, right) => RuleConclusion::Le(left, right),
+                        RuleFact::Ge(left, right) => RuleConclusion::Ge(left, right),
+                        RuleFact::Rel(_) => {
+                            return Err("rule conclusion must be =, <=, or >=".into());
+                        }
+                    };
+                    let mut bound = Vec::new();
+                    let mut used = Vec::new();
+                    variables(&args[0], &mut bound);
+                    variables(&args[1], &mut used);
+                    if used.iter().any(|variable| !bound.contains(variable)) {
+                        return Err("rule conclusion has an unbound pattern variable".into());
+                    }
+                    rules.push(Rule {
+                        premises,
+                        conclusion,
+                    });
+                }
                 "run" => {
-                    arity(1)?;
+                    if !(1..=2).contains(&args.len()) {
+                        return Err("run expects a limit and optional :expand-le".into());
+                    }
                     let limit: usize = atom(&args[0])?
                         .parse()
                         .map_err(|_| "run expects a nonnegative integer".to_string())?;
+                    if args.len() == 2 && atom(&args[1])? != ":expand-le" {
+                        return Err("unknown run option (expected :expand-le)".into());
+                    }
+                    if args.len() == 2 {
+                        eg.set_variance_strategy(VarianceStrategy::Eager);
+                    }
                     for _ in 0..limit {
-                        if !eg.rewrite_step_with_order(&rewrites, &le_rewrites, &ge_rewrites) {
+                        if !eg.rewrite_step_with_rules(
+                            &rewrites,
+                            &le_rewrites,
+                            &ge_rewrites,
+                            &rules,
+                        ) {
                             break;
                         }
+                    }
+                    if args.len() == 2 {
+                        eg.set_variance_strategy(VarianceStrategy::Cartesian);
                     }
                 }
                 "refinement-closure" => {
@@ -420,6 +499,12 @@ mod tests {
         .unwrap();
     }
     #[test]
+    fn reset_clears_multipattern_rules() {
+        run("(rule ((Rel a)) (<= a b)) (reset) (insert a) (run 1)
+             (fail (guard-le a b))")
+        .unwrap();
+    }
+    #[test]
     fn refinement_is_directional_and_transitive() {
         run("(insert (inter A B))
              (rewrite-le (inter ?a ?b) ?a)
@@ -467,8 +552,63 @@ mod tests {
         .unwrap();
     }
     #[test]
+    fn rule_joins_relation_and_order_premises() {
+        run("(insert (f a b)) (insert (f c d))
+             (le a c) (le b d)
+             (rule ((Rel (f ?x ?y)) (Rel (f ?u ?v))
+                    (<= ?x ?u) (<= ?y ?v))
+                   (<= (f ?x ?y) (f ?u ?v)))
+             (run 1)
+             (guard-le (f a b) (f c d))")
+        .unwrap();
+    }
+    #[test]
+    fn rule_supports_equality_and_bare_relation_premises() {
+        run("(insert (pair a b)) (union a c)
+             (rule ((pair ?x ?y) (= ?x c)) (= ?y d))
+             (run 1)
+             (guard b d)")
+        .unwrap();
+    }
+    #[test]
+    fn rel_variable_matches_any_existing_eclass() {
+        run("(insert a) (insert b)
+             (rule ((Rel ?x) (= ?x a)) (<= ?x Top))
+             (run 1)
+             (guard-le a Top)
+             (fail (guard-le b Top))")
+        .unwrap();
+    }
+    #[test]
+    fn rule_supports_ge_premises_and_conclusions() {
+        run("(insert (tag a)) (le a b)
+             (rule ((Rel (tag ?x)) (>= b ?x)) (>= (tag ?x) z))
+             (run 1)
+             (guard-le z (tag a))")
+        .unwrap();
+    }
+    #[test]
+    fn rule_matching_does_not_panic_on_a_different_symbol_arity() {
+        run("(fun f (+)) (insert (f a b))
+             (rule ((Rel (f ?x ?y))) (<= ?x ?y))
+             (run 1) (guard-le a b)")
+        .unwrap();
+    }
+    #[test]
+    fn rule_proves_residuation_from_an_inequality_premise() {
+        run("(insert (comp J X)) (le (comp J X) G)
+             (rule ((<= (comp ?j ?x) ?g))
+                   (<= ?x (rdiv ?g ?j)))
+             (run 1)
+             (guard-le X (rdiv G J))")
+        .unwrap();
+    }
+    #[test]
     fn dontcare_circuit_extracts_a_deterministic_refinement() {
-        assert_eq!(run(include_str!("examples/dontcare.sexp")).unwrap(), ["x"]);
+        assert_eq!(
+            run(include_str!("../examples/dontcare.sexp")).unwrap(),
+            ["x"]
+        );
     }
     #[test]
     fn extraction_follows_both_order_directions() {
@@ -532,6 +672,39 @@ mod tests {
         );
     }
     #[test]
+    fn expand_le_interleaves_variance_and_rewrites() {
+        assert_eq!(
+            run("(fun f (+)) (le a b) (insert (f a))
+                 (rewrite (f b) z)
+                 (run 1 :expand-le) (match (f b)) (match z)
+                 (run 1) (match z)")
+            .unwrap(),
+            ["1 matches", "0 matches", "1 matches"]
+        );
+    }
+    #[test]
+    fn expand_le_only_applies_to_one_run() {
+        assert_eq!(
+            run("(fun f (+)) (le a b) (insert (f a))
+                 (run 1 :expand-le)
+                 (le b c) (run 2) (match (f c))
+                 (run 1 :expand-le) (match (f c))")
+            .unwrap(),
+            ["0 matches", "1 matches"]
+        );
+    }
+    #[test]
+    fn expand_le_limit_stops_cyclic_growth() {
+        assert_eq!(
+            run("(fun f (+)) (union a (f a)) (le a b)
+                 (run 3 :expand-le)
+                 (match (f (f (f b))))
+                 (match (f (f (f (f b)))))")
+            .unwrap(),
+            ["1 matches", "0 matches"]
+        );
+    }
+    #[test]
     fn refinement_closure_limit_stops_cyclic_growth() {
         assert_eq!(
             run("(fun f (+)) (union a (f a)) (le a b)
@@ -560,6 +733,10 @@ mod tests {
         assert!(run("(rewrite-ge (f ?x) ?y)").is_err());
         assert!(run("(refine a b)").is_err());
         assert!(run("(refinement-closure)").is_err());
+        assert!(run("(run 2 :unknown)").is_err());
+        assert!(run("(run 2 :expand-le :unknown)").is_err());
+        assert!(run("(rule ((Rel (f ?x))) (<= ?x ?y))").is_err());
+        assert!(run("(rule ((Rel a)) (Rel b))").is_err());
         assert!(run("(fun f (+)) (fun f (-))").is_err());
     }
 }

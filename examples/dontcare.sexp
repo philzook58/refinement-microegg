@@ -7,8 +7,7 @@
 (le false dontcare)
 
 (insert (ite x true dontcare))
-(refinement-closure 3)
-(run 5)
+(run 5 :expand-le)
 (guard-le (ite x true false) (ite x true dontcare))
 (guard (ite x true false) x)
 (guard-le x (ite x true dontcare))

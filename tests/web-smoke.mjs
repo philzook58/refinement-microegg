@@ -10,6 +10,7 @@ for (const [name, expected] of [
   ["dontcare.sexp", "x"],
   ["set_algebra.sexp", "A"],
   ["ac_le.sexp", "AC and order passed"],
+  ["relation_algebra.sexp", "division passed"],
 ]) {
   const program = readFileSync(new URL(`../examples/${name}`, import.meta.url), "utf8");
   const output = run_wasm(program);

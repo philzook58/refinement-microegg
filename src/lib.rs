@@ -25,13 +25,48 @@ pub struct StepProfile {
 
 // The basics
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
-pub struct Node(Symbol, Vec<Id>);
+pub struct Node {
+    f: Symbol,
+    args: Vec<Id>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Variance {
     Covariant,
     Contravariant,
     Invariant,
+}
+
+/// Which classes may be used relative to a starting class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Below,
+    Exact,
+    Above,
+}
+
+impl Variance {
+    fn act(self, mode: Mode) -> Mode {
+        match self {
+            Self::Covariant => mode,
+            Self::Contravariant => match mode {
+                Mode::Below => Mode::Above,
+                Mode::Exact => Mode::Exact,
+                Mode::Above => Mode::Below,
+            },
+            Self::Invariant => Mode::Exact,
+        }
+    }
+}
+
+impl Mode {
+    fn holds(self, uf: &UnionFind, source: Id, candidate: Id) -> bool {
+        match self {
+            Self::Below => uf.is_le(candidate, source),
+            Self::Exact => uf.are_eq(source, candidate),
+            Self::Above => uf.is_le(source, candidate),
+        }
+    }
 }
 
 /// Experimental ways to propagate declared variance.
@@ -52,10 +87,10 @@ pub struct VarianceProfile {
 
 impl std::fmt::Display for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.1.is_empty() {
-            write!(f, "{}", self.0)
+        if self.args.is_empty() {
+            write!(f, "{}", self.f)
         } else {
-            write!(f, "({} {})", self.0, DisplayIter(&self.1, " "))
+            write!(f, "({} {})", self.f, DisplayIter(&self.args, " "))
         }
     }
 }
@@ -120,6 +155,13 @@ impl EGraph {
     pub fn lower_classes(&self, id: Id) -> Vec<Id> {
         self.uf.lower_set(id)
     }
+    fn classes_in_mode(&self, id: Id, mode: Mode) -> Vec<Id> {
+        match mode {
+            Mode::Below => self.lower_classes(id),
+            Mode::Exact => vec![self.uf.find(id)],
+            Mode::Above => self.upper_classes(id),
+        }
+    }
     pub fn declare_variance(&mut self, symbol: Symbol, args: Vec<Variance>) -> Result<(), String> {
         if let Some(old) = self.variance.get(&symbol) {
             return if old == &args {
@@ -131,7 +173,7 @@ impl EGraph {
         if self
             .nodes
             .keys()
-            .any(|node| node.0 == symbol && node.1.len() != args.len())
+            .any(|node| node.f == symbol && node.args.len() != args.len())
         {
             return Err(format!("existing {symbol} node has a different arity"));
         }
@@ -189,26 +231,28 @@ impl EGraph {
             .flat_map(|(&class, nodes)| nodes.iter().map(move |node| (class, node.clone())))
             .filter(|(_, node)| {
                 self.variance
-                    .get(&node.0)
-                    .is_some_and(|v| v.len() == node.1.len())
+                    .get(&node.f)
+                    .is_some_and(|v| v.len() == node.args.len())
             })
             .collect();
         let mut new_order = false;
         for (class, node) in nodes {
-            for (index, variance) in self.variance[&node.0].clone().into_iter().enumerate() {
+            for (index, variance) in self.variance[&node.f].clone().into_iter().enumerate() {
                 if variance == Variance::Invariant {
                     continue;
                 }
-                let child = self.uf.find(node.1[index]);
+                let child = self.uf.find(node.args[index]);
                 for lower in self.uf.direct_lower(child) {
                     profile.candidates += 1;
-                    let added = self.variance_neighbor(class, &node, index, variance, lower, false);
+                    let added =
+                        self.variance_neighbor(class, &node, index, variance, lower, Mode::Below);
                     profile.edges_added += u64::from(added);
                     new_order |= added;
                 }
                 for upper in self.uf.direct_upper(child) {
                     profile.candidates += 1;
-                    let added = self.variance_neighbor(class, &node, index, variance, upper, true);
+                    let added =
+                        self.variance_neighbor(class, &node, index, variance, upper, Mode::Above);
                     profile.edges_added += u64::from(added);
                     new_order |= added;
                 }
@@ -235,11 +279,11 @@ impl EGraph {
         for (node, &class) in &self.nodes {
             if self
                 .variance
-                .get(&node.0)
-                .is_some_and(|v| v.len() == node.1.len())
+                .get(&node.f)
+                .is_some_and(|v| v.len() == node.args.len())
             {
                 groups
-                    .entry(node.0)
+                    .entry(node.f)
                     .or_default()
                     .push((class, node.clone()));
             }
@@ -253,21 +297,13 @@ impl EGraph {
                         continue;
                     }
                     profile.candidates += 1;
-                    let ordered =
-                        signature
-                            .iter()
-                            .enumerate()
-                            .all(|(index, variance)| match variance {
-                                Variance::Covariant => {
-                                    self.uf.is_le(lower.1[index], upper.1[index])
-                                }
-                                Variance::Contravariant => {
-                                    self.uf.is_le(upper.1[index], lower.1[index])
-                                }
-                                Variance::Invariant => {
-                                    self.uf.are_eq(lower.1[index], upper.1[index])
-                                }
-                            });
+                    let ordered = signature.iter().enumerate().all(|(index, variance)| {
+                        variance.act(Mode::Above).holds(
+                            &self.uf,
+                            lower.args[index],
+                            upper.args[index],
+                        )
+                    });
                     if ordered {
                         changed |=
                             self.add_existing_order_edge(*lower_class, *upper_class, profile);
@@ -284,8 +320,8 @@ impl EGraph {
             .iter()
             .filter(|(node, _)| {
                 self.variance
-                    .get(&node.0)
-                    .is_some_and(|v| v.len() == node.1.len())
+                    .get(&node.f)
+                    .is_some_and(|v| v.len() == node.args.len())
             })
             .map(|(node, &class)| (class, node.clone()))
             .collect();
@@ -293,24 +329,24 @@ impl EGraph {
         let mut lowers = FxHashMap::default();
         let mut changed = false;
         for (class, node) in nodes {
-            let mut choices = Vec::with_capacity(node.1.len());
-            for (child, variance) in node.1.iter().zip(&self.variance[&node.0]) {
+            let mut choices = Vec::with_capacity(node.args.len());
+            for (child, variance) in node.args.iter().zip(&self.variance[&node.f]) {
                 let child = self.uf.find(*child);
-                let options = match variance {
-                    Variance::Covariant => uppers
+                let options = match variance.act(Mode::Above) {
+                    Mode::Above => uppers
                         .entry(child)
                         .or_insert_with(|| self.uf.upper_set(child))
                         .clone(),
-                    Variance::Contravariant => lowers
+                    Mode::Below => lowers
                         .entry(child)
                         .or_insert_with(|| self.uf.lower_set(child))
                         .clone(),
-                    Variance::Invariant => vec![child],
+                    Mode::Exact => vec![child],
                 };
                 choices.push(options);
             }
-            let mut args = node.1.clone();
-            changed |= self.lookup_variance_product(class, node.0, &choices, 0, &mut args, profile);
+            let mut args = node.args.clone();
+            changed |= self.lookup_variance_product(class, node.f, &choices, 0, &mut args, profile);
         }
         changed
     }
@@ -326,7 +362,10 @@ impl EGraph {
     ) -> bool {
         if index == choices.len() {
             profile.candidates += 1;
-            if let Some(&target) = self.nodes.get(&Node(symbol, args.clone())) {
+            if let Some(&target) = self.nodes.get(&Node {
+                f: symbol,
+                args: args.clone(),
+            }) {
                 return self.add_existing_order_edge(source, target, profile);
             }
             return false;
@@ -347,19 +386,15 @@ impl EGraph {
         index: usize,
         variance: Variance,
         child: Id,
-        is_upper: bool,
+        child_mode: Mode,
     ) -> bool {
         let mut variant = node.clone();
-        variant.1[index] = child;
+        variant.args[index] = child;
         let other = self.add_node(variant);
-        let changed = match (variance, is_upper) {
-            (Variance::Covariant, true) | (Variance::Contravariant, false) => {
-                self.uf.assert_le_edge(class, other)
-            }
-            (Variance::Covariant, false) | (Variance::Contravariant, true) => {
-                self.uf.assert_le_edge(other, class)
-            }
-            (Variance::Invariant, _) => unreachable!(),
+        let changed = match variance.act(child_mode) {
+            Mode::Above => self.uf.assert_le_edge(class, other),
+            Mode::Below => self.uf.assert_le_edge(other, class),
+            Mode::Exact => unreachable!(),
         };
         self.needs_rebuild |= changed;
         changed
@@ -367,25 +402,22 @@ impl EGraph {
 
     /// Pick the smallest finite term in a class. Cycles are skipped.
     pub fn extract(&self, id: Id) -> Option<Sexp> {
-        self.best_terms()
-            .get(&self.uf.find(id))
-            .map(|(_, term)| term.clone())
+        self.extract_in_mode(id, Mode::Exact)
     }
 
     /// Pick the smallest term from any class known to be <= this class.
     pub fn extract_le(&self, id: Id) -> Option<Sexp> {
-        let best = self.best_terms();
-        self.lower_classes(id)
-            .iter()
-            .filter_map(|class| best.get(class))
-            .min_by_key(|(cost, _)| *cost)
-            .map(|(_, term)| term.clone())
+        self.extract_in_mode(id, Mode::Below)
     }
 
     /// Pick the smallest term from any class known to be >= this class.
     pub fn extract_ge(&self, id: Id) -> Option<Sexp> {
+        self.extract_in_mode(id, Mode::Above)
+    }
+
+    fn extract_in_mode(&self, id: Id, mode: Mode) -> Option<Sexp> {
         let best = self.best_terms();
-        self.upper_classes(id)
+        self.classes_in_mode(id, mode)
             .iter()
             .filter_map(|class| best.get(class))
             .min_by_key(|(cost, _)| *cost)
@@ -401,7 +433,7 @@ impl EGraph {
                     let mut cost = 1usize;
                     let mut args = Vec::new();
                     let mut ready = true;
-                    for child in &node.1 {
+                    for child in &node.args {
                         if let Some((child_cost, term)) = best.get(&self.uf.find(*child)) {
                             cost = cost.saturating_add(*child_cost);
                             args.push(term.clone());
@@ -414,9 +446,9 @@ impl EGraph {
                         continue;
                     }
                     let term = if args.is_empty() {
-                        Sexp::Atom(node.0)
+                        Sexp::Atom(node.f)
                     } else {
-                        let mut items = vec![Sexp::Atom(node.0)];
+                        let mut items = vec![Sexp::Atom(node.f)];
                         items.extend(args);
                         Sexp::List(items)
                     };
@@ -459,14 +491,14 @@ impl EGraph {
     }
 
     fn is_node_canonical(&self, node: &Node) -> bool {
-        node.1.iter().all(|id| self.uf.is_leader(*id))
+        node.args.iter().all(|id| self.uf.is_leader(*id))
     }
 
     pub fn canonicalize_node(&mut self, node: &Node) -> Node {
-        Node(
-            node.0.clone(),
-            node.1.iter().map(|id| self.uf.find_mut(*id)).collect(),
-        )
+        Node {
+            f: node.f,
+            args: node.args.iter().map(|id| self.uf.find_mut(*id)).collect(),
+        }
     }
 
     pub fn rebuild(&mut self) {
@@ -541,77 +573,42 @@ impl EGraph {
 
 // e-matching
 // we will reuse sexps as patterns, where atoms starting with ? are treated as pattern variables
-#[derive(Clone, Copy)]
-enum MatchDirection {
-    Exact,
-    Above,
-    Below,
-}
-
-impl MatchDirection {
-    fn in_argument(self, variance: Variance) -> Self {
-        match variance {
-            Variance::Covariant => self,
-            Variance::Contravariant => match self {
-                Self::Above => Self::Below,
-                Self::Below => Self::Above,
-                Self::Exact => Self::Exact,
-            },
-            Variance::Invariant => Self::Exact,
-        }
-    }
-}
-
 impl EGraph {
     pub fn ematch(&self, pat: &Sexp, class: Id) -> Vec<Subst> {
         self.ematch_rec(pat, class, Default::default())
     }
     pub fn ematch_rec(&self, pat: &Sexp, class: Id, subst: Subst) -> Vec<Subst> {
-        self.ematch_direction(pat, class, subst, MatchDirection::Exact)
+        self.ematch_direction(pat, class, subst, Mode::Exact)
     }
 
     /// Find substitutions for which `class <= pat[subst]`.
     pub fn ematch_above(&self, pat: &Sexp, class: Id) -> Vec<Subst> {
-        self.ematch_direction(pat, class, Default::default(), MatchDirection::Above)
+        self.ematch_direction(pat, class, Default::default(), Mode::Above)
     }
 
     /// Find substitutions for which `pat[subst] <= class`.
     pub fn ematch_below(&self, pat: &Sexp, class: Id) -> Vec<Subst> {
-        self.ematch_direction(pat, class, Default::default(), MatchDirection::Below)
+        self.ematch_direction(pat, class, Default::default(), Mode::Below)
     }
 
-    fn ematch_direction(
-        &self,
-        pat: &Sexp,
-        class: Id,
-        subst: Subst,
-        direction: MatchDirection,
-    ) -> Vec<Subst> {
-        let classes = match direction {
-            MatchDirection::Exact => vec![self.uf.find(class)],
-            MatchDirection::Above => self.upper_classes(class),
-            MatchDirection::Below => self.lower_classes(class),
-        };
-        classes
+    fn ematch_direction(&self, pat: &Sexp, class: Id, subst: Subst, direction: Mode) -> Vec<Subst> {
+        self.classes_in_mode(class, direction)
             .into_iter()
             .flat_map(|candidate| self.ematch_in_class(pat, candidate, subst.clone(), direction))
             .collect()
     }
 
-    fn ematch_in_class(
-        &self,
-        pat: &Sexp,
-        class: Id,
-        subst: Subst,
-        direction: MatchDirection,
-    ) -> Vec<Subst> {
+    fn ematch_in_class(&self, pat: &Sexp, class: Id, subst: Subst, direction: Mode) -> Vec<Subst> {
         match pat {
             Sexp::Atom(name) => {
                 // all atoms beginning with ? are treated as pattern variables
                 let subst: Option<Subst> = if name.as_str().starts_with('?') {
                     subst.with(*name, class)
                 } else {
-                    let leaf = Node(*name, vec![]);
+                    let leaf = Node {
+                        f: *name,
+                        args: vec![],
+                    };
                     (self.nodes.get(&leaf) == Some(&class)).then(|| subst)
                 };
                 subst.into_iter().collect()
@@ -621,23 +618,24 @@ impl EGraph {
                     panic!("expected atom at head of list");
                 };
                 self.nodes_in_class(class)
-                    .filter(|node| (node.0, node.1.len()) == (*f, args.len()))
+                    .filter(|node| (node.f, node.args.len()) == (*f, args.len()))
                     .flat_map(|node| {
                         let init = vec![subst.clone()];
-                        args.iter()
-                            .zip(&node.1)
-                            .enumerate()
-                            .fold(init, |todo, (i, (pa, &na))| {
+                        args.iter().zip(&node.args).enumerate().fold(
+                            init,
+                            |todo, (i, (pa, &na))| {
                                 let variance = self
                                     .variance
                                     .get(f)
+                                    .filter(|signature| signature.len() == args.len())
                                     .map(|signature| signature[i])
                                     .unwrap_or(Variance::Invariant);
-                                let child_direction = direction.in_argument(variance);
+                                let child_direction = variance.act(direction);
                                 let rec =
                                     |subst| self.ematch_direction(pa, na, subst, child_direction);
                                 todo.into_iter().flat_map(rec).collect()
-                            })
+                            },
+                        )
                     })
                     .collect()
             }
@@ -646,6 +644,27 @@ impl EGraph {
 }
 
 pub type Rewrite = (Sexp, Sexp);
+
+#[derive(Clone, Debug)]
+pub enum RuleFact {
+    Eq(Sexp, Sexp),
+    Le(Sexp, Sexp),
+    Ge(Sexp, Sexp),
+    Rel(Sexp),
+}
+
+#[derive(Clone, Debug)]
+pub enum RuleConclusion {
+    Eq(Sexp, Sexp),
+    Le(Sexp, Sexp),
+    Ge(Sexp, Sexp),
+}
+
+#[derive(Clone, Debug)]
+pub struct Rule {
+    pub premises: Vec<RuleFact>,
+    pub conclusion: RuleConclusion,
+}
 
 // rewriting, rebuilding
 impl EGraph {
@@ -656,12 +675,24 @@ impl EGraph {
         le_rewrites: &[Rewrite],
         ge_rewrites: &[Rewrite],
     ) -> bool {
+        self.rewrite_step_with_rules(rewrites, le_rewrites, ge_rewrites, &[])
+    }
+
+    /// Apply rewrites and multipattern rules against one rebuilt graph snapshot.
+    pub fn rewrite_step_with_rules(
+        &mut self,
+        rewrites: &[Rewrite],
+        le_rewrites: &[Rewrite],
+        ge_rewrites: &[Rewrite],
+        rules: &[Rule],
+    ) -> bool {
         self.rebuild();
         let before = (self.nodes.len(), self.uf.n_classes());
         let equalities = self.collect_matches(rewrites);
-        let less_than = self.collect_order_matches(le_rewrites, MatchDirection::Above);
-        let greater_than = self.collect_order_matches(ge_rewrites, MatchDirection::Below);
-        let unions = self.apply_matches(equalities);
+        let less_than = self.collect_order_matches(le_rewrites, Mode::Above);
+        let greater_than = self.collect_order_matches(ge_rewrites, Mode::Below);
+        let rule_matches = self.collect_rule_matches(rules);
+        let mut unions = self.apply_matches(equalities);
         let mut new_order = false;
         for (rhs, class, matches) in less_than {
             for subst in matches {
@@ -673,6 +704,27 @@ impl EGraph {
             for subst in matches {
                 let lower = self.instantiate(rhs, &subst);
                 new_order |= self.assert_le(lower, class);
+            }
+        }
+        for (rule, matches) in rule_matches {
+            for subst in matches {
+                match &rule.conclusion {
+                    RuleConclusion::Eq(left, right) => {
+                        let left = self.instantiate(left, &subst);
+                        let right = self.instantiate(right, &subst);
+                        unions += usize::from(self.union(left, right));
+                    }
+                    RuleConclusion::Le(left, right) => {
+                        let left = self.instantiate(left, &subst);
+                        let right = self.instantiate(right, &subst);
+                        new_order |= self.assert_le(left, right);
+                    }
+                    RuleConclusion::Ge(left, right) => {
+                        let left = self.instantiate(left, &subst);
+                        let right = self.instantiate(right, &subst);
+                        new_order |= self.assert_le(right, left);
+                    }
+                }
             }
         }
         if unions != 0 || new_order || self.nodes.len() != before.0 {
@@ -693,14 +745,17 @@ impl EGraph {
     pub fn instantiate(&mut self, pattern: &Sexp, subst: &Subst) -> Id {
         match pattern {
             Sexp::Atom(name) if name.as_str().starts_with('?') => subst[*name],
-            Sexp::Atom(name) => self.add_node(Node(*name, vec![])),
+            Sexp::Atom(name) => self.add_node(Node {
+                f: *name,
+                args: vec![],
+            }),
             Sexp::List(items) => {
                 let Some((Sexp::Atom(f), args)) = items.split_first() else {
                     panic!("expected atom at head of list");
                 };
                 let rec = |arg| self.instantiate(arg, subst);
                 let args = args.iter().map(rec).collect();
-                self.add_node(Node(*f, args))
+                self.add_node(Node { f: *f, args })
             }
         }
     }
@@ -726,7 +781,7 @@ impl EGraph {
     fn collect_order_matches<'a>(
         &self,
         rules: &'a [Rewrite],
-        direction: MatchDirection,
+        direction: Mode,
     ) -> Vec<(&'a Sexp, Id, Vec<Subst>)> {
         let mut all_matches = vec![];
         for (lhs, rhs) in rules {
@@ -738,6 +793,50 @@ impl EGraph {
             }
         }
         all_matches
+    }
+
+    fn collect_rule_matches<'a>(&self, rules: &'a [Rule]) -> Vec<(&'a Rule, Vec<Subst>)> {
+        rules
+            .iter()
+            .map(|rule| {
+                let matches = rule
+                    .premises
+                    .iter()
+                    .fold(vec![Subst::default()], |todo, fact| {
+                        todo.into_iter()
+                            .flat_map(|subst| self.match_rule_fact(fact, subst))
+                            .collect()
+                    });
+                (rule, matches)
+            })
+            .collect()
+    }
+
+    fn match_rule_fact(&self, fact: &RuleFact, subst: Subst) -> Vec<Subst> {
+        match fact {
+            RuleFact::Rel(pattern) => self
+                .rev
+                .keys()
+                .flat_map(|&class| self.ematch_rec(pattern, class, subst.clone()))
+                .collect(),
+            RuleFact::Eq(left, right) | RuleFact::Le(left, right) | RuleFact::Ge(left, right) => {
+                let mut matches = Vec::new();
+                for &left_class in self.rev.keys() {
+                    for left_subst in self.ematch_rec(left, left_class, subst.clone()) {
+                        let mode = match fact {
+                            RuleFact::Eq(_, _) => Mode::Exact,
+                            RuleFact::Le(_, _) => Mode::Above,
+                            RuleFact::Ge(_, _) => Mode::Below,
+                            RuleFact::Rel(_) => unreachable!(),
+                        };
+                        for right_class in self.classes_in_mode(left_class, mode) {
+                            matches.extend(self.ematch_rec(right, right_class, left_subst.clone()));
+                        }
+                    }
+                }
+                matches
+            }
+        }
     }
 
     fn apply_matches(&mut self, all_matches: Vec<(&Sexp, Id, Vec<Subst>)>) -> usize {
@@ -914,9 +1013,15 @@ fn refinement_matches_a_covariant_child_without_materializing_it() {
 
     eg.refinement_step(&[], &refinements);
 
-    let z = eg.nodes[&Node("z".into(), vec![])];
+    let z = eg.nodes[&Node {
+        f: "z".into(),
+        args: vec![],
+    }];
     assert!(eg.is_le(target, z));
-    assert!(!eg.nodes.contains_key(&Node("f".into(), vec![b])));
+    assert!(!eg.nodes.contains_key(&Node {
+        f: "f".into(),
+        args: vec![b],
+    }));
     assert!(eg.ematch_below(&sexp("(f b)"), target).is_empty());
 }
 
@@ -934,9 +1039,15 @@ fn refinement_matching_flips_in_a_contravariant_child() {
 
     eg.refinement_step(&[], &refinements);
 
-    let z = eg.nodes[&Node("z".into(), vec![])];
+    let z = eg.nodes[&Node {
+        f: "z".into(),
+        args: vec![],
+    }];
     assert!(eg.is_le(target, z));
-    assert!(!eg.nodes.contains_key(&Node("f".into(), vec![a])));
+    assert!(!eg.nodes.contains_key(&Node {
+        f: "f".into(),
+        args: vec![a],
+    }));
 }
 
 #[test]
@@ -952,11 +1063,17 @@ fn refinement_matching_requires_equality_in_an_invariant_child() {
     let refinements = [(sexp("(f b)"), sexp("z"))];
 
     eg.refinement_step(&[], &refinements);
-    assert!(!eg.nodes.contains_key(&Node("z".into(), vec![])));
+    assert!(!eg.nodes.contains_key(&Node {
+        f: "z".into(),
+        args: vec![],
+    }));
 
     eg.union(a, b);
     eg.refinement_step(&[], &refinements);
-    let z = eg.nodes[&Node("z".into(), vec![])];
+    let z = eg.nodes[&Node {
+        f: "z".into(),
+        args: vec![],
+    }];
     assert!(eg.is_le(target, z));
 }
 
@@ -972,7 +1089,10 @@ fn refinement_matching_searches_upper_eclasses() {
 
     eg.refinement_step(&[], &[(sexp("b"), sexp("z"))]);
 
-    let z = eg.nodes[&Node("z".into(), vec![])];
+    let z = eg.nodes[&Node {
+        f: "z".into(),
+        args: vec![],
+    }];
     assert!(eg.is_le(a, z));
 }
 
@@ -993,7 +1113,10 @@ fn existing_node_variance_does_not_match_unmaterialized_rewrite_terms() {
                 break;
             }
         }
-        eg.nodes.contains_key(&Node("c".into(), vec![]))
+        eg.nodes.contains_key(&Node {
+            f: "c".into(),
+            args: vec![],
+        })
     };
     assert!(run(VarianceStrategy::Eager));
     assert!(!run(VarianceStrategy::Cartesian));

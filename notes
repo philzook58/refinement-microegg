@@ -126,7 +126,11 @@ https://www.philipzucker.com/a-short-skinny-on-relations-towards-the-algebra-of-
 galois connections?
 (rule (<= (f a) b)  (<= a (g b))not persay a rewrite. 
 This is more like a solve-eq rule (rule (= x (+ y z)) (= (x - z) y)
+Still. Fun stuff.
+Dijsktra had stuff like this. Mathmagic
 
+https://arxiv.org/html/2307.12224v1 caculational proofs acl2
+Rustan Leino MathMagic something? http://www.mathmeth.com/read.shtml
 
 
 So sometimes we may want to extract the most refined thing and of those, the best one. A lex extraction of refinement (refine, cost)

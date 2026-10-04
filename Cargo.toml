@@ -3,13 +3,6 @@ name = "refinement-microegg"
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-path = "lib.rs"
-
-[[bin]]
-name = "refinement-microegg"
-path = "main.rs"
-
 [dependencies]
 clap = "=4.6.6"
 indexmap = "2.13"

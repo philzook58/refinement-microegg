@@ -33,7 +33,7 @@ jobs:
           mkdir -p site/pkg site/examples
           cp -r pkg/. site/pkg/
           cp index.html site/
-          cp examples/{refinement,dontcare,set_algebra,ac_le}.sexp site/examples/
+          cp examples/{refinement,dontcare,set_algebra,ac_le,relation_algebra}.sexp site/examples/
           touch site/.nojekyll
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
