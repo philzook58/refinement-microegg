@@ -10,6 +10,7 @@ This is useful perhaps because as the story goes, many rewrites in compilers are
 
 Previous discussions of mine on refinement e-graphs:
 
+- <https://www.philipzucker.com/refinement_egraph/> Refinement E-Graphs
 - <https://www.philipzucker.com/asymmetric_complete/> An Inequality Union Find Inspired by Atomic Asymmetric Completion
 - <https://www.philipzucker.com/le_find/> Inequality Union Finds: Baby Steps to Refinement E-graphs
 
